@@ -1,0 +1,281 @@
+-- SQL-92 BNF Grammar Reference (Simplified)
+-- This is a reference for implementing the PizzaSQL parser.
+
+-- Statements
+<statement> ::=
+    <select-statement>
+  | <insert-statement>
+  | <update-statement>
+  | <delete-statement>
+  | <create-table-statement>
+  | <drop-table-statement>
+
+-- SELECT Statement
+<select-statement> ::=
+    SELECT [ ALL | DISTINCT ] <select-list>
+    [ <from-clause> ]
+    [ <where-clause> ]
+    [ <group-by-clause> ]
+    [ <having-clause> ]
+    [ <order-by-clause> ]
+    [ <limit-clause> ]
+
+<select-list> ::=
+    <asterisk>
+  | <select-item> [ { <comma> <select-item> }... ]
+
+<select-item> ::=
+    <expression> [ [ AS ] <column-alias> ]
+  | <table-name> <period> <asterisk>
+
+<from-clause> ::=
+    FROM <table-reference> [ { <comma> <table-reference> }... ]
+
+<table-reference> ::=
+    <table-name> [ [ AS ] <table-alias> ]
+  | <table-reference> <join-type> <table-reference> <join-condition>
+
+<join-type> ::=
+    [ INNER ] JOIN
+  | LEFT [ OUTER ] JOIN
+  | RIGHT [ OUTER ] JOIN
+  | FULL [ OUTER ] JOIN
+  | CROSS JOIN
+  | NATURAL JOIN
+
+<join-condition> ::=
+    ON <search-condition>
+  | USING <left-paren> <column-name-list> <right-paren>
+
+<where-clause> ::=
+    WHERE <search-condition>
+
+<group-by-clause> ::=
+    GROUP BY <expression-list>
+
+<having-clause> ::=
+    HAVING <search-condition>
+
+<order-by-clause> ::=
+    ORDER BY <order-item> [ { <comma> <order-item> }... ]
+
+<order-item> ::=
+    <expression> [ ASC | DESC ]
+
+<limit-clause> ::=
+    LIMIT <expression> [ OFFSET <expression> ]
+
+-- INSERT Statement
+<insert-statement> ::=
+    INSERT INTO <table-name>
+    [ <left-paren> <column-name-list> <right-paren> ]
+    <insert-source>
+
+<insert-source> ::=
+    VALUES <values-list>
+  | <select-statement>
+
+<values-list> ::=
+    <left-paren> <expression-list> <right-paren>
+    [ { <comma> <left-paren> <expression-list> <right-paren> }... ]
+
+-- UPDATE Statement
+<update-statement> ::=
+    UPDATE <table-name>
+    SET <assignment-list>
+    [ <where-clause> ]
+
+<assignment-list> ::=
+    <assignment> [ { <comma> <assignment> }... ]
+
+<assignment> ::=
+    <column-name> <equals> <expression>
+
+-- DELETE Statement
+<delete-statement> ::=
+    DELETE FROM <table-name>
+    [ <where-clause> ]
+
+-- CREATE TABLE Statement
+<create-table-statement> ::=
+    CREATE TABLE [ IF NOT EXISTS ] <table-name>
+    <left-paren>
+        <table-element> [ { <comma> <table-element> }... ]
+    <right-paren>
+
+<table-element> ::=
+    <column-definition>
+  | <table-constraint>
+
+<column-definition> ::=
+    <column-name> <data-type> [ <column-constraint>... ]
+
+<data-type> ::=
+    INTEGER | INT | SMALLINT | BIGINT
+  | REAL | FLOAT | DOUBLE
+  | NUMERIC [ <left-paren> <precision> [ <comma> <scale> ] <right-paren> ]
+  | DECIMAL [ <left-paren> <precision> [ <comma> <scale> ] <right-paren> ]
+  | TEXT
+  | VARCHAR [ <left-paren> <length> <right-paren> ]
+  | CHAR [ <left-paren> <length> <right-paren> ]
+  | CHARACTER [ <left-paren> <length> <right-paren> ]
+  | BLOB
+  | BOOLEAN
+  | DATE | TIME | TIMESTAMP | DATETIME
+
+<column-constraint> ::=
+    PRIMARY KEY
+  | NOT NULL
+  | UNIQUE
+  | DEFAULT <expression>
+  | REFERENCES <table-name> [ <left-paren> <column-name> <right-paren> ]
+  | AUTOINCREMENT
+
+<table-constraint> ::=
+    [ CONSTRAINT <constraint-name> ]
+    (   PRIMARY KEY <left-paren> <column-name-list> <right-paren>
+      | UNIQUE <left-paren> <column-name-list> <right-paren>
+      | FOREIGN KEY <left-paren> <column-name-list> <right-paren>
+            REFERENCES <table-name> <left-paren> <column-name-list> <right-paren>
+      | CHECK <left-paren> <search-condition> <right-paren>
+    )
+
+-- DROP TABLE Statement
+<drop-table-statement> ::=
+    DROP TABLE [ IF EXISTS ] <table-name> [ { <comma> <table-name> }... ]
+
+-- Expressions
+<expression> ::=
+    <or-expression>
+
+<or-expression> ::=
+    <and-expression>
+  | <or-expression> OR <and-expression>
+
+<and-expression> ::=
+    <not-expression>
+  | <and-expression> AND <not-expression>
+
+<not-expression> ::=
+    NOT <not-expression>
+  | <comparison-expression>
+
+<comparison-expression> ::=
+    <additive-expression>
+  | <additive-expression> <comparison-operator> <additive-expression>
+  | <additive-expression> IS [ NOT ] NULL
+  | <additive-expression> [ NOT ] IN <in-value>
+  | <additive-expression> [ NOT ] BETWEEN <additive-expression> AND <additive-expression>
+  | <additive-expression> [ NOT ] LIKE <additive-expression> [ ESCAPE <additive-expression> ]
+
+<comparison-operator> ::=
+    <equals> | <not-equals> | <less-than> | <greater-than>
+  | <less-than-or-equals> | <greater-than-or-equals>
+
+<in-value> ::=
+    <left-paren> <expression-list> <right-paren>
+  | <left-paren> <select-statement> <right-paren>
+
+<additive-expression> ::=
+    <multiplicative-expression>
+  | <additive-expression> <plus> <multiplicative-expression>
+  | <additive-expression> <minus> <multiplicative-expression>
+  | <additive-expression> <concat> <multiplicative-expression>
+
+<multiplicative-expression> ::=
+    <unary-expression>
+  | <multiplicative-expression> <asterisk> <unary-expression>
+  | <multiplicative-expression> <slash> <unary-expression>
+  | <multiplicative-expression> <percent> <unary-expression>
+
+<unary-expression> ::=
+    <primary-expression>
+  | <minus> <unary-expression>
+  | <plus> <unary-expression>
+
+<primary-expression> ::=
+    <literal>
+  | <column-reference>
+  | <function-call>
+  | <case-expression>
+  | <cast-expression>
+  | <exists-expression>
+  | <left-paren> <expression> <right-paren>
+  | <left-paren> <select-statement> <right-paren>
+
+<literal> ::=
+    <number>
+  | <string>
+  | NULL
+  | TRUE
+  | FALSE
+
+<column-reference> ::=
+    [ <table-name> <period> ] <column-name>
+
+<function-call> ::=
+    <function-name> <left-paren>
+        [ [ DISTINCT ] <expression-list> | <asterisk> ]
+    <right-paren>
+
+<case-expression> ::=
+    CASE [ <expression> ]
+        <when-clause>...
+        [ ELSE <expression> ]
+    END
+
+<when-clause> ::=
+    WHEN <expression> THEN <expression>
+
+<cast-expression> ::=
+    CAST <left-paren> <expression> AS <data-type> <right-paren>
+
+<exists-expression> ::=
+    EXISTS <left-paren> <select-statement> <right-paren>
+
+-- Lists
+<expression-list> ::=
+    <expression> [ { <comma> <expression> }... ]
+
+<column-name-list> ::=
+    <column-name> [ { <comma> <column-name> }... ]
+
+-- Tokens
+<table-name> ::= <identifier>
+<column-name> ::= <identifier>
+<table-alias> ::= <identifier>
+<column-alias> ::= <identifier>
+<function-name> ::= <identifier>
+<constraint-name> ::= <identifier>
+
+<identifier> ::=
+    <regular-identifier>
+  | <delimited-identifier>
+
+<regular-identifier> ::= <letter> [ { <letter> | <digit> | <underscore> }... ]
+<delimited-identifier> ::=
+    <double-quote> <character>... <double-quote>
+  | <backtick> <character>... <backtick>
+  | <left-bracket> <character>... <right-bracket>
+
+<number> ::= <integer> | <float>
+<string> ::= <single-quote> <character>... <single-quote>
+
+-- Symbols
+<left-paren> ::= (
+<right-paren> ::= )
+<comma> ::= ,
+<period> ::= .
+<semicolon> ::= ;
+<asterisk> ::= *
+<plus> ::= +
+<minus> ::= -
+<slash> ::= /
+<percent> ::= %
+<concat> ::= ||
+<equals> ::= =
+<not-equals> ::= <> | !=
+<less-than> ::= <
+<greater-than> ::= >
+<less-than-or-equals> ::= <=
+<greater-than-or-equals> ::= >=

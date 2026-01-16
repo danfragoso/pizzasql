@@ -1,0 +1,82 @@
+package httpserver
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+// ColumnInfo represents column metadata.
+type ColumnInfo struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// QueryResponse represents a query response.
+type QueryResponse struct {
+	Columns       []ColumnInfo    `json:"columns"`
+	Rows          [][]interface{} `json:"rows"`
+	RowsAffected  int64           `json:"rowsAffected"`
+	LastInsertID  int64           `json:"lastInsertId"`
+	ExecutionTime string          `json:"executionTime"`
+	QueryPlan     []string        `json:"queryPlan,omitempty"`
+}
+
+// ExecuteResult represents a single execution result.
+type ExecuteResult struct {
+	RowsAffected int64 `json:"rowsAffected"`
+	LastInsertID int64 `json:"lastInsertId"`
+}
+
+// ExecuteResponse represents a batch execution response.
+type ExecuteResponse struct {
+	Results       []ExecuteResult `json:"results"`
+	ExecutionTime string          `json:"executionTime"`
+}
+
+// ErrorResponse represents an error response.
+type ErrorResponse struct {
+	Error ErrorDetail `json:"error"`
+}
+
+// ErrorDetail contains error details.
+type ErrorDetail struct {
+	Code    string                 `json:"code"`
+	Message string                 `json:"message"`
+	Details map[string]interface{} `json:"details,omitempty"`
+}
+
+// HTTPError represents an HTTP error with custom fields.
+type HTTPError struct {
+	Code    string
+	Message string
+	Status  int
+	Details map[string]interface{}
+}
+
+func (e *HTTPError) Error() string {
+	return e.Message
+}
+
+// writeJSON writes a JSON response.
+func writeJSON(w http.ResponseWriter, status int, data interface{}, pretty bool) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	encoder := json.NewEncoder(w)
+	if pretty {
+		encoder.SetIndent("", "  ")
+	}
+	encoder.Encode(data)
+}
+
+// writeError writes an error response.
+func writeError(w http.ResponseWriter, status int, code, message string, details map[string]interface{}) {
+	resp := ErrorResponse{
+		Error: ErrorDetail{
+			Code:    code,
+			Message: message,
+			Details: details,
+		},
+	}
+	writeJSON(w, status, resp, false)
+}

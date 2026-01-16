@@ -1,0 +1,484 @@
+package parser
+
+import "github.com/danfragoso/pizzasql-next/pkg/lexer"
+
+// Node is the base interface for all AST nodes.
+type Node interface {
+	node()
+}
+
+// Statement represents a SQL statement.
+type Statement interface {
+	Node
+	stmtNode()
+}
+
+// Expr represents an expression.
+type Expr interface {
+	Node
+	exprNode()
+}
+
+// SelectStmt represents a SELECT statement.
+type SelectStmt struct {
+	Distinct bool
+	Columns  []SelectColumn
+	From     []TableRef
+	Where    Expr
+	GroupBy  []Expr
+	Having   Expr
+	OrderBy  []OrderByItem
+	Limit    Expr
+	Offset   Expr
+}
+
+func (s *SelectStmt) node()     {}
+func (s *SelectStmt) stmtNode() {}
+
+// SelectColumn represents a column in SELECT.
+type SelectColumn struct {
+	Expr  Expr
+	Alias string
+	Star  bool // true if this is *
+}
+
+// TableRef represents a table reference.
+type TableRef struct {
+	Schema   string
+	Name     string
+	Alias    string
+	Subquery *SelectStmt // for derived tables (SELECT ... FROM (SELECT ...) AS alias)
+	Join     *JoinClause // for joined tables
+}
+
+// JoinClause represents a JOIN clause.
+type JoinClause struct {
+	Type      JoinType
+	Table     *TableRef
+	Condition Expr     // ON condition
+	Using     []string // USING columns
+}
+
+// JoinType represents the type of JOIN.
+type JoinType int
+
+const (
+	JoinInner JoinType = iota
+	JoinLeft
+	JoinRight
+	JoinFull
+	JoinCross
+)
+
+// OrderByItem represents an ORDER BY item.
+type OrderByItem struct {
+	Expr Expr
+	Desc bool
+}
+
+// ConflictAction represents the action to take on conflict.
+type ConflictAction int
+
+const (
+	ConflictAbort    ConflictAction = iota // Default
+	ConflictReplace                        // INSERT OR REPLACE
+	ConflictIgnore                         // INSERT OR IGNORE
+	ConflictFail                           // INSERT OR FAIL
+	ConflictRollback                       // INSERT OR ROLLBACK
+)
+
+// InsertStmt represents an INSERT statement.
+type InsertStmt struct {
+	Table      *TableRef
+	Columns    []string
+	Values     [][]Expr
+	Select     *SelectStmt    // INSERT ... SELECT
+	OnConflict ConflictAction // OR REPLACE/IGNORE/etc.
+}
+
+func (s *InsertStmt) node()     {}
+func (s *InsertStmt) stmtNode() {}
+
+// UpdateStmt represents an UPDATE statement.
+type UpdateStmt struct {
+	Table *TableRef
+	Set   []Assignment
+	Where Expr
+}
+
+func (s *UpdateStmt) node()     {}
+func (s *UpdateStmt) stmtNode() {}
+
+// Assignment represents a SET assignment.
+type Assignment struct {
+	Column string
+	Value  Expr
+}
+
+// DeleteStmt represents a DELETE statement.
+type DeleteStmt struct {
+	Table *TableRef
+	Where Expr
+}
+
+func (s *DeleteStmt) node()     {}
+func (s *DeleteStmt) stmtNode() {}
+
+// CreateTableStmt represents a CREATE TABLE statement.
+type CreateTableStmt struct {
+	IfNotExists bool
+	Table       *TableRef
+	Columns     []ColumnDef
+	Constraints []TableConstraint
+}
+
+func (s *CreateTableStmt) node()     {}
+func (s *CreateTableStmt) stmtNode() {}
+
+// ColumnDef represents a column definition.
+type ColumnDef struct {
+	Name        string
+	Type        DataType
+	Constraints []ColumnConstraint
+}
+
+// DataType represents a SQL data type.
+type DataType struct {
+	Name      string
+	Precision int // for VARCHAR(n), NUMERIC(p,s)
+	Scale     int // for NUMERIC(p,s)
+}
+
+// ColumnConstraint represents a column-level constraint.
+type ColumnConstraint struct {
+	Type      ConstraintType
+	Name      string // optional constraint name
+	Default   Expr   // for DEFAULT
+	RefTable  string // for REFERENCES
+	RefColumn string // for REFERENCES
+}
+
+// ConstraintType represents the type of constraint.
+type ConstraintType int
+
+const (
+	ConstraintPrimaryKey ConstraintType = iota
+	ConstraintNotNull
+	ConstraintUnique
+	ConstraintDefault
+	ConstraintCheck
+	ConstraintForeignKey
+	ConstraintAutoIncrement
+)
+
+// TableConstraint represents a table-level constraint.
+type TableConstraint struct {
+	Type       ConstraintType
+	Name       string   // optional constraint name
+	Columns    []string // columns involved
+	RefTable   string   // for FOREIGN KEY
+	RefColumns []string // for FOREIGN KEY
+	Check      Expr     // for CHECK
+}
+
+// DropTableStmt represents a DROP TABLE statement.
+type DropTableStmt struct {
+	IfExists bool
+	Tables   []*TableRef
+}
+
+func (s *DropTableStmt) node()     {}
+func (s *DropTableStmt) stmtNode() {}
+
+// CreateIndexStmt represents a CREATE INDEX statement.
+type CreateIndexStmt struct {
+	IfNotExists bool
+	Unique      bool
+	Name        string
+	Table       string
+	Columns     []IndexColumn
+}
+
+func (s *CreateIndexStmt) node()     {}
+func (s *CreateIndexStmt) stmtNode() {}
+
+// IndexColumn represents a column in an index.
+type IndexColumn struct {
+	Name string
+	Desc bool // true for DESC ordering
+}
+
+// DropIndexStmt represents a DROP INDEX statement.
+type DropIndexStmt struct {
+	IfExists bool
+	Name     string
+}
+
+func (s *DropIndexStmt) node()     {}
+func (s *DropIndexStmt) stmtNode() {}
+
+// AlterTableStmt represents an ALTER TABLE statement.
+type AlterTableStmt struct {
+	Table  string
+	Action AlterAction
+}
+
+func (s *AlterTableStmt) node()     {}
+func (s *AlterTableStmt) stmtNode() {}
+
+// AlterAction represents an ALTER TABLE action.
+type AlterAction interface {
+	Node
+	alterAction()
+}
+
+// AddColumnAction represents ADD COLUMN action.
+type AddColumnAction struct {
+	Column *ColumnDef
+}
+
+func (a *AddColumnAction) node()        {}
+func (a *AddColumnAction) alterAction() {}
+
+// DropColumnAction represents DROP COLUMN action.
+type DropColumnAction struct {
+	Column string
+}
+
+func (a *DropColumnAction) node()        {}
+func (a *DropColumnAction) alterAction() {}
+
+// RenameTableAction represents RENAME TO action.
+type RenameTableAction struct {
+	NewName string
+}
+
+func (a *RenameTableAction) node()        {}
+func (a *RenameTableAction) alterAction() {}
+
+// RenameColumnAction represents RENAME COLUMN action.
+type RenameColumnAction struct {
+	OldName string
+	NewName string
+}
+
+func (a *RenameColumnAction) node()        {}
+func (a *RenameColumnAction) alterAction() {}
+
+// AttachStmt represents an ATTACH DATABASE statement.
+type AttachStmt struct {
+	FilePath string // Database file path or identifier
+	Alias    string // Database alias name
+}
+
+func (s *AttachStmt) node()     {}
+func (s *AttachStmt) stmtNode() {}
+
+// DetachStmt represents a DETACH DATABASE statement.
+type DetachStmt struct {
+	Alias string // Database alias to detach
+}
+
+func (s *DetachStmt) node()     {}
+func (s *DetachStmt) stmtNode() {}
+
+// PragmaStmt represents a PRAGMA statement.
+type PragmaStmt struct {
+	Name  string // pragma name (e.g., "table_info")
+	Arg   string // optional argument (e.g., table name)
+	Value Expr   // optional value for SET pragmas
+}
+
+func (s *PragmaStmt) node()     {}
+func (s *PragmaStmt) stmtNode() {}
+
+// ExplainStmt represents an EXPLAIN statement.
+type ExplainStmt struct {
+	QueryPlan bool      // true for EXPLAIN QUERY PLAN
+	Statement Statement // the statement being explained
+}
+
+func (s *ExplainStmt) node()     {}
+func (s *ExplainStmt) stmtNode() {}
+
+// Transaction statements
+
+// BeginStmt represents a BEGIN TRANSACTION statement.
+type BeginStmt struct {
+	// Transaction mode (DEFERRED, IMMEDIATE, EXCLUSIVE) - for future use
+	Mode string
+}
+
+func (s *BeginStmt) node()     {}
+func (s *BeginStmt) stmtNode() {}
+
+// CommitStmt represents a COMMIT statement.
+type CommitStmt struct{}
+
+func (s *CommitStmt) node()     {}
+func (s *CommitStmt) stmtNode() {}
+
+// RollbackStmt represents a ROLLBACK statement.
+type RollbackStmt struct {
+	Savepoint string // for ROLLBACK TO SAVEPOINT
+}
+
+func (s *RollbackStmt) node()     {}
+func (s *RollbackStmt) stmtNode() {}
+
+// SavepointStmt represents a SAVEPOINT statement.
+type SavepointStmt struct {
+	Name string
+}
+
+func (s *SavepointStmt) node()     {}
+func (s *SavepointStmt) stmtNode() {}
+
+// ReleaseStmt represents a RELEASE SAVEPOINT statement.
+type ReleaseStmt struct {
+	Name string
+}
+
+func (s *ReleaseStmt) node()     {}
+func (s *ReleaseStmt) stmtNode() {}
+
+// Expression types
+
+// BinaryExpr represents a binary expression.
+type BinaryExpr struct {
+	Left  Expr
+	Op    lexer.TokenType
+	Right Expr
+}
+
+func (e *BinaryExpr) node()     {}
+func (e *BinaryExpr) exprNode() {}
+
+// UnaryExpr represents a unary expression.
+type UnaryExpr struct {
+	Op      lexer.TokenType
+	Operand Expr
+}
+
+func (e *UnaryExpr) node()     {}
+func (e *UnaryExpr) exprNode() {}
+
+// LiteralExpr represents a literal value.
+type LiteralExpr struct {
+	Type  lexer.TokenType // TokenNumber, TokenString, TokenNULL, TokenTRUE, TokenFALSE
+	Value string
+}
+
+func (e *LiteralExpr) node()     {}
+func (e *LiteralExpr) exprNode() {}
+
+// ColumnRef represents a column reference.
+type ColumnRef struct {
+	Table  string
+	Column string
+}
+
+func (e *ColumnRef) node()     {}
+func (e *ColumnRef) exprNode() {}
+
+// FunctionCall represents a function call.
+type FunctionCall struct {
+	Name     string
+	Args     []Expr
+	Distinct bool // for COUNT(DISTINCT x)
+	Star     bool // for COUNT(*)
+}
+
+func (e *FunctionCall) node()     {}
+func (e *FunctionCall) exprNode() {}
+
+// SubqueryExpr represents a subquery expression.
+type SubqueryExpr struct {
+	Query *SelectStmt
+}
+
+func (e *SubqueryExpr) node()     {}
+func (e *SubqueryExpr) exprNode() {}
+
+// CaseExpr represents a CASE expression.
+type CaseExpr struct {
+	Operand Expr // for CASE operand WHEN...
+	Whens   []WhenClause
+	Else    Expr
+}
+
+func (e *CaseExpr) node()     {}
+func (e *CaseExpr) exprNode() {}
+
+// WhenClause represents a WHEN clause in CASE.
+type WhenClause struct {
+	Condition Expr
+	Result    Expr
+}
+
+// InExpr represents an IN expression.
+type InExpr struct {
+	Left     Expr
+	Not      bool
+	Values   []Expr      // IN (1, 2, 3)
+	Subquery *SelectStmt // IN (SELECT ...)
+}
+
+func (e *InExpr) node()     {}
+func (e *InExpr) exprNode() {}
+
+// BetweenExpr represents a BETWEEN expression.
+type BetweenExpr struct {
+	Left Expr
+	Not  bool
+	Low  Expr
+	High Expr
+}
+
+func (e *BetweenExpr) node()     {}
+func (e *BetweenExpr) exprNode() {}
+
+// LikeExpr represents a LIKE expression.
+type LikeExpr struct {
+	Left    Expr
+	Not     bool
+	Pattern Expr
+	Escape  Expr
+}
+
+func (e *LikeExpr) node()     {}
+func (e *LikeExpr) exprNode() {}
+
+// IsNullExpr represents an IS NULL expression.
+type IsNullExpr struct {
+	Left Expr
+	Not  bool
+}
+
+func (e *IsNullExpr) node()     {}
+func (e *IsNullExpr) exprNode() {}
+
+// CastExpr represents a CAST expression.
+type CastExpr struct {
+	Expr Expr
+	Type DataType
+}
+
+func (e *CastExpr) node()     {}
+func (e *CastExpr) exprNode() {}
+
+// ExistsExpr represents an EXISTS expression.
+type ExistsExpr struct {
+	Subquery *SelectStmt
+}
+
+func (e *ExistsExpr) node()     {}
+func (e *ExistsExpr) exprNode() {}
+
+// ParenExpr represents a parenthesized expression.
+type ParenExpr struct {
+	Expr Expr
+}
+
+func (e *ParenExpr) node()     {}
+func (e *ParenExpr) exprNode() {}
