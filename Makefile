@@ -2,7 +2,10 @@
 
 # Build the project
 build:
-	go build -o pizzasql ./main.go
+	go build -o ./bin/pizzasql ./main.go
+
+build-linux-amd64:
+	GOOS=linux GOARCH=amd64 go build -o ./bin/pizzasql-linux-amd64 ./main.go
 
 # Run all tests
 test:
