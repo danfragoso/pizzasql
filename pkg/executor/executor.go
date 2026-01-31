@@ -84,6 +84,8 @@ func (e *Executor) SyncCatalog() error {
 		if err != nil {
 			continue
 		}
+		// Drop table from catalog if it exists, then recreate with updated schema
+		e.catalog.DropTable(tableName)
 		e.catalog.CreateTable(schema.ToAnalyzerTableInfo())
 	}
 
@@ -757,15 +759,27 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 func (e *Executor) mergeRows(left, right storage.Row, leftAlias, rightAlias string) storage.Row {
 	result := make(storage.Row)
 	for k, v := range left {
+		// Copy the key as-is (it might already be qualified)
 		result[k] = v
-		if leftAlias != "" {
+		// Only add qualified name if the key is NOT already qualified and we have an alias
+		if leftAlias != "" && !strings.Contains(k, ".") {
 			result[leftAlias+"."+k] = v
 		}
 	}
 	for k, v := range right {
-		result[k] = v
-		if rightAlias != "" {
-			result[rightAlias+"."+k] = v
+		// For unqualified names, only add if they don't already exist
+		// This prevents right table columns from overwriting left table columns
+		if !strings.Contains(k, ".") {
+			if _, exists := result[k]; !exists {
+				result[k] = v
+			}
+			// Add qualified name for right table
+			if rightAlias != "" {
+				result[rightAlias+"."+k] = v
+			}
+		} else {
+			// Already qualified, just copy it
+			result[k] = v
 		}
 	}
 	return result
@@ -1741,8 +1755,17 @@ func (e *Executor) evalExpr(expr parser.Expr, row storage.Row) (interface{}, err
 func (e *Executor) evalLiteral(lit *parser.LiteralExpr) (interface{}, error) {
 	switch lit.Type {
 	case lexer.TokenNumber:
-		if strings.Contains(lit.Value, ".") {
-			return strconv.ParseFloat(lit.Value, 64)
+		// Check for scientific notation (e.g., 1e+06) or decimal point
+		if strings.Contains(lit.Value, ".") || strings.ContainsAny(lit.Value, "eE") {
+			f, err := strconv.ParseFloat(lit.Value, 64)
+			if err != nil {
+				return nil, err
+			}
+			// If it's a whole number (no fractional part), return as int64
+			if f == float64(int64(f)) {
+				return int64(f), nil
+			}
+			return f, nil
 		}
 		return strconv.ParseInt(lit.Value, 10, 64)
 	case lexer.TokenString:

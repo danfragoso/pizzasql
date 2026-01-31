@@ -16,6 +16,10 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/httpserver"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/csvexport"
+	"github.com/danfragoso/pizzasql-next/pkg/csvimport"
+	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
+	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
@@ -30,6 +34,15 @@ var (
 	httpCORS   = flag.Bool("http-cors", true, "Enable CORS")
 	httpAuth   = flag.Bool("http-auth", false, "Enable authentication")
 	apiKeys    = flag.String("api-keys", "", "Comma-separated API keys")
+
+	// Export/Import flags
+	exportFile   = flag.String("o", "", "Output file for export")
+	importFile   = flag.String("i", "", "Input file for import")
+	exportTable  = flag.String("table", "", "Specific table to export (empty = all)")
+	exportDrop   = flag.Bool("drop", false, "Include DROP TABLE statements in export")
+	ignoreErrors = flag.Bool("ignore-errors", false, "Continue import on errors")
+	exportFormat = flag.String("format", "", "Export/import format: sql, csv (auto-detect from extension)")
+	createTable  = flag.Bool("create-table", false, "Create table if not exists (CSV import)")
 )
 
 func main() {
@@ -38,6 +51,18 @@ func main() {
 	// Check if HTTP server mode is enabled
 	if *httpEnable {
 		runHTTPServer()
+		return
+	}
+
+	// Check for export command
+	if *exportFile != "" {
+		runExport()
+		return
+	}
+
+	// Check for import command
+	if *importFile != "" {
+		runImport()
 		return
 	}
 
@@ -456,6 +481,18 @@ func printHelp() {
 	fmt.Println("Expression Mode (SELECT without FROM):")
 	fmt.Println("  SELECT 1 + 2 * 3;")
 	fmt.Println("  SELECT UPPER('hello');")
+	fmt.Println()
+	fmt.Println("Export/Import:")
+	fmt.Println("  pizzasql -db mydb -o backup.sql           Export database to SQL file")
+	fmt.Println("  pizzasql -db mydb -table users -o t.sql   Export single table")
+	fmt.Println("  pizzasql -db mydb -o backup.sql -drop     Include DROP TABLE statements")
+	fmt.Println("  pizzasql -db mydb -i backup.sql           Import SQL file")
+	fmt.Println("  pizzasql -db mydb -i backup.sql -ignore-errors  Continue on errors")
+	fmt.Println()
+	fmt.Println("CSV Format:")
+	fmt.Println("  pizzasql -db mydb -table users -o users.csv         Export table to CSV")
+	fmt.Println("  pizzasql -db mydb -table users -i users.csv         Import CSV to table")
+	fmt.Println("  pizzasql -db mydb -table new -i data.csv -create-table  Create table from CSV")
 }
 
 func listTables(schema *storage.SchemaManager) {
@@ -475,6 +512,194 @@ func listTables(schema *storage.SchemaManager) {
 		fmt.Printf("  %s\n", t)
 	}
 }
+func runExport() {
+	// Connect to PizzaKV
+	pool, err := storage.NewKVPool(*kvAddr, *poolSize, *timeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect to PizzaKV at %s: %v\n", *kvAddr, err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	schema := storage.NewSchemaManager(pool, *database)
+	table := storage.NewTableManager(pool, schema, *database)
+
+	// Determine format from flag or file extension
+	format := strings.ToLower(*exportFormat)
+	if format == "" {
+		format = detectFileFormat(*exportFile)
+	}
+
+	switch format {
+	case "csv":
+		// CSV export requires a table name
+		if *exportTable == "" {
+			fmt.Fprintf(os.Stderr, "CSV export requires -table flag\n")
+			os.Exit(1)
+		}
+
+		csvOpts := csvexport.DefaultExportOptions()
+		csvOpts.Table = *exportTable
+
+		data, err := csvexport.ExportTableToBytes(schema, table, csvOpts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Export failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		err = os.WriteFile(*exportFile, data, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write file: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Exported table '%s' to %s (CSV)\n", *exportTable, *exportFile)
+
+	default: // sql, sqlite
+		// Configure export options
+		opts := sqlexport.ExportOptions{
+			IncludeData: true,
+			DropTables:  *exportDrop,
+		}
+
+		if *exportTable != "" {
+			opts.Tables = []string{*exportTable}
+		}
+
+		// Export database
+		sql, err := sqlexport.ExportDatabase(schema, table, opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Export failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Write to file
+		err = os.WriteFile(*exportFile, []byte(sql), 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write file: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Exported database '%s' to %s\n", *database, *exportFile)
+	}
+}
+
+func runImport() {
+	// Connect to PizzaKV
+	pool, err := storage.NewKVPool(*kvAddr, *poolSize, *timeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect to PizzaKV at %s: %v\n", *kvAddr, err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	schema := storage.NewSchemaManager(pool, *database)
+	table := storage.NewTableManager(pool, schema, *database)
+	exec := executor.New(schema, table)
+	exec.SyncCatalog()
+
+	// Read file
+	data, err := os.ReadFile(*importFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read file: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Determine format from flag or file extension
+	format := strings.ToLower(*exportFormat)
+	if format == "" {
+		format = detectFileFormat(*importFile)
+	}
+
+	switch format {
+	case "csv":
+		// CSV import requires a table name
+		if *exportTable == "" {
+			fmt.Fprintf(os.Stderr, "CSV import requires -table flag\n")
+			os.Exit(1)
+		}
+
+		csvOpts := csvimport.DefaultImportOptions()
+		csvOpts.TableName = *exportTable
+		csvOpts.IgnoreErrors = *ignoreErrors
+		csvOpts.CreateTable = *createTable
+
+		result, err := csvimport.ImportCSV(strings.NewReader(string(data)), schema, table, csvOpts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Import failed: %v\n", err)
+			if len(result.Errors) > 0 {
+				fmt.Fprintf(os.Stderr, "Errors:\n")
+				for _, e := range result.Errors {
+					fmt.Fprintf(os.Stderr, "  - %s\n", e)
+				}
+			}
+			os.Exit(1)
+		}
+
+		fmt.Printf("CSV import completed successfully\n")
+		fmt.Printf("  Rows imported: %d\n", result.RowsImported)
+		if result.RowsSkipped > 0 {
+			fmt.Printf("  Rows skipped: %d\n", result.RowsSkipped)
+		}
+		if result.TableCreated {
+			fmt.Printf("  Table created: %s\n", *exportTable)
+		}
+		if len(result.Errors) > 0 {
+			fmt.Printf("  Warnings/Errors: %d\n", len(result.Errors))
+			for _, e := range result.Errors {
+				fmt.Printf("    - %s\n", e)
+			}
+		}
+
+	default: // sql, sqlite
+		// Configure import options
+		opts := sqlimport.ImportOptions{
+			IgnoreErrors: *ignoreErrors,
+		}
+
+		// Import SQL
+		result, err := sqlimport.ImportSQL(exec, string(data), opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Import failed: %v\n", err)
+			if len(result.Errors) > 0 {
+				fmt.Fprintf(os.Stderr, "Errors:\n")
+				for _, e := range result.Errors {
+					fmt.Fprintf(os.Stderr, "  - %s\n", e)
+				}
+			}
+			os.Exit(1)
+		}
+
+		fmt.Printf("Import completed successfully\n")
+		fmt.Printf("  Statements executed: %d\n", result.StatementsExecuted)
+		if len(result.TablesCreated) > 0 {
+			fmt.Printf("  Tables created: %s\n", strings.Join(result.TablesCreated, ", "))
+		}
+		if len(result.TablesDropped) > 0 {
+			fmt.Printf("  Tables dropped: %s\n", strings.Join(result.TablesDropped, ", "))
+		}
+		fmt.Printf("  Rows inserted: %d\n", result.RowsInserted)
+
+		if len(result.Errors) > 0 {
+			fmt.Printf("  Warnings/Errors: %d\n", len(result.Errors))
+			for _, e := range result.Errors {
+				fmt.Printf("    - %s\n", e)
+			}
+		}
+	}
+}
+
+func detectFileFormat(filename string) string {
+	lower := strings.ToLower(filename)
+	if strings.HasSuffix(lower, ".csv") {
+		return "csv"
+	}
+	if strings.HasSuffix(lower, ".db") || strings.HasSuffix(lower, ".sqlite") || strings.HasSuffix(lower, ".sqlite3") {
+		return "sqlite"
+	}
+	return "sql"
+}
+
 func runHTTPServer() {
 	// Connect to PizzaKV
 	pool, err := storage.NewKVPool(*kvAddr, *poolSize, *timeout)
@@ -485,10 +710,12 @@ func runHTTPServer() {
 	}
 	defer pool.Close()
 
-	// Create schema and executor
-	schema := storage.NewSchemaManager(pool, *database)
-	table := storage.NewTableManager(pool, schema, *database)
-	exec := executor.New(schema, table)
+	// Create database manager for multi-database support
+	dbManagerConfig := &storage.DatabaseManagerConfig{
+		DefaultDatabase: *database,
+		AutoCreate:      true, // Auto-create databases on first access
+	}
+	dbManager := storage.NewDatabaseManager(pool, dbManagerConfig)
 
 	// Configure HTTP server
 	config := httpserver.DefaultConfig()
@@ -501,8 +728,8 @@ func runHTTPServer() {
 		config.APIKeys = strings.Split(*apiKeys, ",")
 	}
 
-	// Create and start server
-	server := httpserver.New(config, exec, schema)
+	// Create and start server with multi-database support
+	server := httpserver.NewWithDatabaseManager(config, dbManager)
 
 	// Handle graceful shutdown
 	stop := make(chan os.Signal, 1)
@@ -517,8 +744,11 @@ func runHTTPServer() {
 	}()
 
 	fmt.Printf("PizzaSQL HTTP server started on http://%s:%d\n", *httpHost, *httpPort)
-	fmt.Printf("Database: %s\n", *database)
+	fmt.Printf("Default database: %s\n", *database)
 	fmt.Printf("PizzaKV: %s\n", *kvAddr)
+	fmt.Println()
+	fmt.Println("Multi-database support enabled!")
+	fmt.Println("Use the X-Database header to select a database per request.")
 	fmt.Println()
 	fmt.Println("Endpoints:")
 	fmt.Println("  POST   /query                - Execute SQL query")
@@ -532,8 +762,12 @@ func runHTTPServer() {
 	fmt.Println("  POST   /transaction/commit   - Commit transaction")
 	fmt.Println("  POST   /transaction/rollback - Rollback transaction")
 	fmt.Println()
-	fmt.Println("Example:")
+	fmt.Println("Examples:")
+	fmt.Printf("  # Query default database\n")
 	fmt.Printf("  curl -X POST http://%s:%d/query -H 'Content-Type: application/json' -d '{\"sql\":\"SELECT 1+1\"}'\n", *httpHost, *httpPort)
+	fmt.Println()
+	fmt.Printf("  # Query specific database using X-Database header\n")
+	fmt.Printf("  curl -X POST http://%s:%d/query -H 'Content-Type: application/json' -H 'X-Database: tenant_db' -d '{\"sql\":\"SELECT * FROM users\"}'\n", *httpHost, *httpPort)
 	fmt.Println()
 	fmt.Println("Press Ctrl+C to stop")
 

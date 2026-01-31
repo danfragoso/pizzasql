@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 )
 
@@ -13,12 +14,15 @@ type ColumnInfo struct {
 
 // QueryResponse represents a query response.
 type QueryResponse struct {
-	Columns       []ColumnInfo    `json:"columns"`
-	Rows          [][]interface{} `json:"rows"`
-	RowsAffected  int64           `json:"rowsAffected"`
-	LastInsertID  int64           `json:"lastInsertId"`
-	ExecutionTime string          `json:"executionTime"`
-	QueryPlan     []string        `json:"queryPlan,omitempty"`
+	Columns      []ColumnInfo    `json:"columns"`
+	Rows         [][]interface{} `json:"rows"`
+	RowsAffected int64           `json:"rowsAffected"`
+	LastInsertID int64           `json:"lastInsertId"`
+	QueryPlan    []string        `json:"queryPlan,omitempty"`
+	// Metrics for usage tracking and billing
+	BytesRead          int64 `json:"bytesRead"`          // Total bytes in the result set
+	RowsReturned       int   `json:"rowsReturned"`       // Number of rows returned
+	ExecutionTimeMicro int64 `json:"executionTimeMicro"` // Execution time in microseconds
 }
 
 // ExecuteResult represents a single execution result.
@@ -78,5 +82,11 @@ func writeError(w http.ResponseWriter, status int, code, message string, details
 			Details: details,
 		},
 	}
+	
+	// Log server errors (5xx status codes)
+	if status >= 500 {
+		log.Printf("ERROR [%d] %s: %s", status, code, message)
+	}
+	
 	writeJSON(w, status, resp, false)
 }

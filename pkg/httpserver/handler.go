@@ -3,13 +3,19 @@ package httpserver
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/danfragoso/pizzasql-next/pkg/csvexport"
+	"github.com/danfragoso/pizzasql-next/pkg/csvimport"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
+	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 )
 
 // QueryRequest represents a single query request.
@@ -44,6 +50,14 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	if req.SQL == "" {
 		writeError(w, http.StatusBadRequest, "MISSING_SQL", "SQL query is required", nil)
+		return
+	}
+
+	// Get database from X-Database header
+	dbName := r.Header.Get("X-Database")
+	exec, _, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
 		return
 	}
 
@@ -101,8 +115,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Execute
-		result, err := s.executor.Execute(stmt)
+		// Execute using the database-specific executor
+		result, err := exec.Execute(stmt)
 		if err != nil {
 			errorChan <- &HTTPError{
 				Code:    "EXECUTION_ERROR",
@@ -116,11 +130,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 		// Build response
 		resp := &QueryResponse{
-			Columns:       make([]ColumnInfo, len(result.Columns)),
-			Rows:          result.Rows,
-			RowsAffected:  result.RowsAffected,
-			LastInsertID:  result.LastInsertID,
-			ExecutionTime: duration.String(),
+			Columns:            make([]ColumnInfo, len(result.Columns)),
+			Rows:               result.Rows,
+			RowsAffected:       result.RowsAffected,
+			LastInsertID:       result.LastInsertID,
+			ExecutionTimeMicro: duration.Microseconds(),
+			RowsReturned:       len(result.Rows),
 		}
 
 		for i, col := range result.Columns {
@@ -133,6 +148,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				Name: col,
 				Type: colType,
 			}
+		}
+
+		// Calculate bytes read (approximate size of the result set)
+		// This is the serialized JSON size of the rows data
+		if jsonBytes, err := json.Marshal(result.Rows); err == nil {
+			resp.BytesRead = int64(len(jsonBytes))
 		}
 
 		if explain {
@@ -180,6 +201,14 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get database from X-Database header
+	dbName := r.Header.Get("X-Database")
+	exec, _, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
 	pretty := r.URL.Query().Get("pretty") == "true"
 	start := time.Now()
 
@@ -190,7 +219,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 		l := lexer.New("BEGIN")
 		p := parser.New(l)
 		stmt, _ := p.Parse()
-		s.executor.Execute(stmt)
+		exec.Execute(stmt)
 	}
 
 	var executeErr error
@@ -206,7 +235,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		result, err := s.executor.Execute(parsed)
+		result, err := exec.Execute(parsed)
 		if err != nil {
 			executeErr = err
 			break
@@ -225,7 +254,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			l := lexer.New("ROLLBACK")
 			p := parser.New(l)
 			stmt, _ := p.Parse()
-			s.executor.Execute(stmt)
+			exec.Execute(stmt)
 
 			writeError(w, http.StatusBadRequest, "TRANSACTION_ERROR", executeErr.Error(), nil)
 			return
@@ -234,7 +263,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 			l := lexer.New("COMMIT")
 			p := parser.New(l)
 			stmt, _ := p.Parse()
-			s.executor.Execute(stmt)
+			exec.Execute(stmt)
 		}
 	} else if executeErr != nil {
 		writeError(w, http.StatusBadRequest, "EXECUTION_ERROR", executeErr.Error(), nil)
@@ -256,14 +285,35 @@ func (s *Server) handleSchemaTables(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tables, err := s.schema.ListTables()
+	// Get database from X-Database header (trim whitespace)
+	dbName := strings.TrimSpace(r.Header.Get("X-Database"))
+
+	// Debug: Log the header value
+	log.Printf("[DEBUG] /schema/tables - X-Database header: %q", dbName)
+
+	_, schema, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
+	// Debug: Log the actual database being used
+	actualDB := schema.GetDatabaseName()
+	log.Printf("[DEBUG] /schema/tables - Resolved to database: %q", actualDB)
+
+	tables, err := schema.ListTables()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "SCHEMA_ERROR", err.Error(), nil)
 		return
 	}
 
+	log.Printf("[DEBUG] /schema/tables - Found %d tables in database %q", len(tables), actualDB)
+
+	// Include the actual database name and requested name in the response for verification
 	resp := map[string]interface{}{
-		"tables": tables,
+		"database":           actualDB,
+		"requested_database": dbName,
+		"tables":             tables,
 	}
 
 	pretty := r.URL.Query().Get("pretty") == "true"
@@ -277,6 +327,14 @@ func (s *Server) handleSchemaTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get database from X-Database header
+	dbName := r.Header.Get("X-Database")
+	_, schemaManager, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
 	// Extract table name from path
 	path := strings.TrimPrefix(r.URL.Path, "/schema/tables/")
 	tableName := strings.TrimSpace(path)
@@ -286,7 +344,7 @@ func (s *Server) handleSchemaTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	schema, err := s.schema.GetSchema(tableName)
+	schema, err := schemaManager.GetSchema(tableName)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "TABLE_NOT_FOUND", fmt.Sprintf("Table '%s' not found", tableName), nil)
 		return
@@ -326,7 +384,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleStats handles GET /stats
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	tables, _ := s.schema.ListTables()
+	// Get database from X-Database header
+	dbName := r.Header.Get("X-Database")
+	_, schema, _ := s.getExecutorForDatabase(dbName)
+
+	var tables []string
+	if schema != nil {
+		tables, _ = schema.ListTables()
+	}
 
 	var avgQueryTime string
 	if s.stats.QueriesExecuted > 0 {
@@ -355,10 +420,18 @@ func (s *Server) handleTransactionBegin(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Get database from X-Database header
+	dbName := r.Header.Get("X-Database")
+	exec, _, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
 	l := lexer.New("BEGIN")
 	p := parser.New(l)
 	stmt, _ := p.Parse()
-	_, err := s.executor.Execute(stmt)
+	_, err = exec.Execute(stmt)
 
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "TRANSACTION_ERROR", err.Error(), nil)
@@ -383,6 +456,14 @@ func (s *Server) handleTransactionCommit(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Get database from X-Database header
+	dbName := r.Header.Get("X-Database")
+	exec, _, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
 	var req TransactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		// Allow commit without transaction ID for simplicity
@@ -391,7 +472,7 @@ func (s *Server) handleTransactionCommit(w http.ResponseWriter, r *http.Request)
 	l := lexer.New("COMMIT")
 	p := parser.New(l)
 	stmt, _ := p.Parse()
-	_, err := s.executor.Execute(stmt)
+	_, err = exec.Execute(stmt)
 
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "TRANSACTION_ERROR", err.Error(), nil)
@@ -477,6 +558,14 @@ func (s *Server) handleTransactionRollback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Get database from X-Database header
+	dbName := r.Header.Get("X-Database")
+	exec, _, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
 	var req TransactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		// Allow rollback without transaction ID for simplicity
@@ -485,7 +574,7 @@ func (s *Server) handleTransactionRollback(w http.ResponseWriter, r *http.Reques
 	l := lexer.New("ROLLBACK")
 	p := parser.New(l)
 	stmt, _ := p.Parse()
-	_, err := s.executor.Execute(stmt)
+	_, err = exec.Execute(stmt)
 
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "TRANSACTION_ERROR", err.Error(), nil)
@@ -507,7 +596,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tables, _ := s.schema.ListTables()
+	// Get database from X-Database header
+	dbName := r.Header.Get("X-Database")
+	_, schema, _ := s.getExecutorForDatabase(dbName)
+
+	var tables []string
+	if schema != nil {
+		tables, _ = schema.ListTables()
+	}
+
 	uptime := time.Since(s.stats.StartTime).Seconds()
 
 	queriesTotal := atomic.LoadInt64(&s.stats.QueriesExecuted)
@@ -541,4 +638,263 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP pizzasql_info PizzaSQL server information\n")
 	fmt.Fprintf(w, "# TYPE pizzasql_info gauge\n")
 	fmt.Fprintf(w, "pizzasql_info{version=\"0.1.0\"} 1\n")
+}
+
+// handleExport handles GET /export
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Only GET method is allowed", nil)
+		return
+	}
+
+	// Get database from X-Database header
+	dbName := strings.TrimSpace(r.Header.Get("X-Database"))
+	_, schema, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
+	// Get the table manager from the database instance
+	dbInstance, err := s.dbManager.GetDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
+	// Get format parameter (default: sql)
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	if format == "" {
+		format = "sql"
+	}
+
+	tableName := r.URL.Query().Get("table")
+
+	switch format {
+	case "csv":
+		// CSV export requires a single table
+		if tableName == "" {
+			writeError(w, http.StatusBadRequest, "TABLE_REQUIRED", "CSV export requires 'table' parameter", nil)
+			return
+		}
+
+		csvOpts := csvexport.DefaultExportOptions()
+		csvOpts.Table = tableName
+
+		data, err := csvexport.ExportTableToBytes(schema, dbInstance.Table, csvOpts)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "EXPORT_ERROR", err.Error(), nil)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/csv")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.csv\"", tableName))
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+
+	case "sql", "sqlite":
+		// SQL export (also used for SQLite-compatible export)
+		opts := sqlexport.DefaultExportOptions()
+
+		// Specific table(s) to export
+		if tableName != "" {
+			opts.Tables = strings.Split(tableName, ",")
+		}
+
+		// Include data (default: true)
+		if r.URL.Query().Get("schema_only") == "true" {
+			opts.IncludeData = false
+		}
+
+		// Include DROP TABLE statements
+		if r.URL.Query().Get("drop") == "true" {
+			opts.DropTables = true
+		}
+
+		// Generate SQL export
+		sql, err := sqlexport.ExportDatabase(schema, dbInstance.Table, opts)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "EXPORT_ERROR", err.Error(), nil)
+			return
+		}
+
+		// Determine filename and content type
+		ext := "sql"
+		contentType := "application/sql"
+		if format == "sqlite" {
+			ext = "sql" // Still SQL text, but sqlite-compatible
+		}
+
+		filename := schema.GetDatabaseName() + "_export." + ext
+		if len(opts.Tables) == 1 {
+			filename = opts.Tables[0] + "_export." + ext
+		}
+
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sql))
+
+	default:
+		writeError(w, http.StatusBadRequest, "INVALID_FORMAT",
+			fmt.Sprintf("Invalid format '%s'. Supported formats: sql, csv", format), nil)
+	}
+}
+
+// handleImport handles POST /import
+func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Only POST method is allowed", nil)
+		return
+	}
+
+	// Get database from X-Database header
+	dbName := strings.TrimSpace(r.Header.Get("X-Database"))
+	exec, schema, err := s.getExecutorForDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
+	// Get the table manager from the database instance
+	dbInstance, err := s.dbManager.GetDatabase(dbName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
+		return
+	}
+
+	// Get format parameter (default: sql, can be auto-detected)
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	tableName := r.URL.Query().Get("table")
+	ignoreErrors := r.URL.Query().Get("ignore_errors") == "true"
+	createTable := r.URL.Query().Get("create_table") == "true"
+	pretty := r.URL.Query().Get("pretty") == "true"
+
+	// Check content type
+	contentType := r.Header.Get("Content-Type")
+
+	var fileContent []byte
+	var filename string
+
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		// Handle file upload
+		if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB max
+			writeError(w, http.StatusBadRequest, "INVALID_FORM", "Failed to parse multipart form: "+err.Error(), nil)
+			return
+		}
+
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "MISSING_FILE", "No file uploaded. Use 'file' field name.", nil)
+			return
+		}
+		defer file.Close()
+		filename = header.Filename
+
+		// Read file content
+		fileContent, err = io.ReadAll(file)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "READ_ERROR", "Failed to read uploaded file: "+err.Error(), nil)
+			return
+		}
+
+	} else if strings.HasPrefix(contentType, "application/json") {
+		// Handle JSON body with SQL content
+		var req struct {
+			SQL string `json:"sql"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "INVALID_JSON", "Invalid JSON in request body", nil)
+			return
+		}
+		fileContent = []byte(req.SQL)
+
+	} else if strings.HasPrefix(contentType, "text/plain") || strings.HasPrefix(contentType, "application/sql") || strings.HasPrefix(contentType, "text/csv") {
+		// Handle raw content in body
+		var err error
+		fileContent, err = io.ReadAll(r.Body)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "READ_ERROR", "Failed to read request body: "+err.Error(), nil)
+			return
+		}
+		// Auto-detect CSV from content type
+		if strings.HasPrefix(contentType, "text/csv") && format == "" {
+			format = "csv"
+		}
+
+	} else {
+		writeError(w, http.StatusBadRequest, "INVALID_CONTENT_TYPE",
+			"Content-Type must be multipart/form-data, application/json, text/plain, text/csv, or application/sql", nil)
+		return
+	}
+
+	if len(fileContent) == 0 {
+		writeError(w, http.StatusBadRequest, "EMPTY_CONTENT", "No content provided", nil)
+		return
+	}
+
+	// Auto-detect format from filename extension if not specified
+	if format == "" && filename != "" {
+		if strings.HasSuffix(strings.ToLower(filename), ".csv") {
+			format = "csv"
+		}
+	}
+	if format == "" {
+		format = "sql"
+	}
+
+	switch format {
+	case "csv":
+		// CSV import requires table name
+		if tableName == "" {
+			writeError(w, http.StatusBadRequest, "TABLE_REQUIRED", "CSV import requires 'table' parameter", nil)
+			return
+		}
+
+		csvOpts := csvimport.DefaultImportOptions()
+		csvOpts.TableName = tableName
+		csvOpts.IgnoreErrors = ignoreErrors
+		csvOpts.CreateTable = createTable
+
+		result, err := csvimport.ImportCSV(strings.NewReader(string(fileContent)), schema, dbInstance.Table, csvOpts)
+		if err != nil && !ignoreErrors {
+			writeError(w, http.StatusBadRequest, "IMPORT_ERROR", err.Error(), map[string]interface{}{
+				"rowsImported": result.RowsImported,
+				"rowsSkipped":  result.RowsSkipped,
+				"tableCreated": result.TableCreated,
+				"errors":       result.Errors,
+			})
+			return
+		}
+
+		// Sync catalog after import
+		exec.SyncCatalog()
+
+		writeJSON(w, http.StatusOK, result, pretty)
+
+	case "sql", "sqlite":
+		// SQL import
+		opts := sqlimport.DefaultImportOptions()
+		opts.IgnoreErrors = ignoreErrors
+
+		result, err := sqlimport.ImportSQL(exec, string(fileContent), opts)
+		if err != nil && !ignoreErrors {
+			writeError(w, http.StatusBadRequest, "IMPORT_ERROR", err.Error(), map[string]interface{}{
+				"statementsExecuted": result.StatementsExecuted,
+				"tablesCreated":      result.TablesCreated,
+				"rowsInserted":       result.RowsInserted,
+				"errors":             result.Errors,
+			})
+			return
+		}
+
+		// Sync catalog after import
+		exec.SyncCatalog()
+
+		writeJSON(w, http.StatusOK, result, pretty)
+
+	default:
+		writeError(w, http.StatusBadRequest, "INVALID_FORMAT",
+			fmt.Sprintf("Invalid format '%s'. Supported formats: sql, csv", format), nil)
+	}
 }

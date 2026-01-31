@@ -63,6 +63,7 @@ PizzaSQL is a SQL-92 compliant database with SQLite compatibility, featuring a h
 - ✅ **CORS Support**: Browser-compatible cross-origin requests
 - ✅ **Response Compression**: gzip for large result sets
 - ✅ **Prometheus Metrics**: Monitor queries, performance, and health
+- ✅ **Import/Export**: Backup and restore databases via SQL files
 
 ### Advanced Features
 
@@ -293,6 +294,70 @@ For quick calculations without PizzaKV:
 ./pizzasql -http -http-port 3000
 ```
 
+### Database Export/Import
+
+Export and import databases using SQL or CSV files for backup and migration.
+
+**SQL Export:**
+```bash
+# Export entire database
+./pizzasql -db mydb -o backup.sql
+
+# Export specific table
+./pizzasql -db mydb -table users -o users.sql
+
+# Include DROP TABLE statements (for clean restore)
+./pizzasql -db mydb -o backup.sql -drop
+```
+
+**CSV Export:**
+```bash
+# Export table to CSV (auto-detected from .csv extension)
+./pizzasql -db mydb -table users -o users.csv
+
+# Explicit format flag
+./pizzasql -db mydb -table users -o users.csv -format csv
+```
+
+**Import:**
+```bash
+# Import SQL file
+./pizzasql -db mydb -i backup.sql
+
+# Import CSV file to existing table
+./pizzasql -db mydb -table users -i users.csv
+
+# Import CSV and create table automatically
+./pizzasql -db mydb -table new_users -i users.csv -create-table
+
+# Continue on errors
+./pizzasql -db mydb -i backup.sql -ignore-errors
+```
+
+**SQL Export Format:**
+```sql
+-- PizzaSQL Export
+-- Database: mydb
+-- Date: 2026-01-21T10:30:00Z
+
+DROP TABLE IF EXISTS users;
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT
+);
+
+INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com');
+INSERT INTO users (id, name, email) VALUES (2, 'Bob', NULL);
+```
+
+**CSV Export Format:**
+```csv
+id,name,email
+1,Alice,alice@example.com
+2,Bob,
+```
+
 ---
 
 ## HTTP API
@@ -499,6 +564,66 @@ curl -X POST http://localhost:8080/transaction/commit
 
 # Rollback transaction
 curl -X POST http://localhost:8080/transaction/rollback
+```
+
+### Import/Export Endpoints
+
+#### GET /export - Export Database
+
+Export the database (or specific tables) to SQL format.
+
+**Query Parameters:**
+- `?table=users` - Export specific table (comma-separated for multiple)
+- `?drop=true` - Include DROP TABLE statements
+- `?schema_only=true` - Export schema only, no data
+
+**Examples:**
+```bash
+# Export entire database
+curl "http://localhost:8080/export" -H "X-Database: mydb" -o backup.sql
+
+# Export with DROP TABLE statements
+curl "http://localhost:8080/export?drop=true" -H "X-Database: mydb" -o backup.sql
+
+# Export specific table
+curl "http://localhost:8080/export?table=users" -H "X-Database: mydb" -o users.sql
+
+# Export schema only (no data)
+curl "http://localhost:8080/export?schema_only=true" -H "X-Database: mydb" -o schema.sql
+```
+
+#### POST /import - Import SQL File
+
+Import SQL statements from a file.
+
+**Query Parameters:**
+- `?ignore_errors=true` - Continue on individual statement errors
+
+**Request:**
+- Content-Type: `multipart/form-data`
+- File field: `file`
+
+**Response:**
+```json
+{
+  "statementsExecuted": 5,
+  "tablesCreated": ["users", "products"],
+  "tablesDropped": [],
+  "rowsInserted": 100
+}
+```
+
+**Examples:**
+```bash
+# Import SQL file
+curl -X POST "http://localhost:8080/import" \
+  -H "X-Database: mydb" \
+  -F "file=@backup.sql"
+
+# Import with error tolerance
+curl -X POST "http://localhost:8080/import?ignore_errors=true" \
+  -H "X-Database: mydb" \
+  -F "file=@backup.sql"
 ```
 
 ### Authentication
@@ -1359,6 +1484,15 @@ CREATE TABLE users (
 -http-cors      Enable CORS headers
 -http-auth      Enable authentication
 -api-keys       Comma-separated API keys
+
+# Export/Import options
+-o string       Output file for export (triggers export mode)
+-i string       Input file for import (triggers import mode)
+-table string   Specific table to export (required for CSV, optional for SQL)
+-format string  Export/import format: sql, csv (auto-detect from extension)
+-drop           Include DROP TABLE statements in export (SQL only)
+-create-table   Create table if not exists (CSV import only)
+-ignore-errors  Continue import on individual statement/row errors
 
 # Other options
 -version        Print version and exit

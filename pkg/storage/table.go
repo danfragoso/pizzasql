@@ -213,6 +213,7 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 	err := m.pool.WithClient(func(c *KVClient) error {
 		var err error
 		values, err = c.Reads(prefix)
+		fmt.Printf("[DEBUG] Select: table=%s, database=%s, prefix=%s, values_count=%d\n", table, m.database, prefix, len(values))
 		return err
 	})
 	if err != nil {
@@ -223,6 +224,7 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 	for _, data := range values {
 		var row Row
 		if err := json.Unmarshal([]byte(data), &row); err != nil {
+			fmt.Printf("[DEBUG] Select: failed to unmarshal row: %v\n", err)
 			continue // Skip invalid rows
 		}
 
@@ -231,6 +233,7 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 		}
 	}
 
+	fmt.Printf("[DEBUG] Select: returning %d rows\n", len(rows))
 	return rows, nil
 }
 
@@ -469,7 +472,24 @@ func IsRowIDColumn(name string) bool {
 
 // indexEntryKey returns the key for an index entry.
 func (m *TableManager) indexEntryKey(indexName string, colValue interface{}) string {
-	return fmt.Sprintf("%s:idx:%s:%v", m.database, strings.ToLower(indexName), colValue)
+	// Format the value without scientific notation
+	var valueStr string
+	switch v := colValue.(type) {
+	case float64:
+		// Check if it's actually an integer value
+		if v == float64(int64(v)) {
+			valueStr = fmt.Sprintf("%d", int64(v))
+		} else {
+			valueStr = fmt.Sprintf("%f", v)
+		}
+	case int64:
+		valueStr = fmt.Sprintf("%d", v)
+	case int:
+		valueStr = fmt.Sprintf("%d", v)
+	default:
+		valueStr = fmt.Sprintf("%v", v)
+	}
+	return fmt.Sprintf("%s:idx:%s:%s", m.database, strings.ToLower(indexName), valueStr)
 }
 
 // indexPrefix returns the prefix for all entries of an index.
@@ -611,14 +631,31 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 
 // buildIndexValue creates the index key value from row columns.
 func (m *TableManager) buildIndexValue(row Row, columns []string) string {
+	formatValue := func(v interface{}) string {
+		switch val := v.(type) {
+		case float64:
+			// Check if it's actually an integer value
+			if val == float64(int64(val)) {
+				return fmt.Sprintf("%d", int64(val))
+			}
+			return fmt.Sprintf("%f", val)
+		case int64:
+			return fmt.Sprintf("%d", val)
+		case int:
+			return fmt.Sprintf("%d", val)
+		default:
+			return fmt.Sprintf("%v", val)
+		}
+	}
+
 	if len(columns) == 1 {
-		return fmt.Sprintf("%v", row[columns[0]])
+		return formatValue(row[columns[0]])
 	}
 
 	// Multi-column index: concatenate values with separator
 	var parts []string
 	for _, col := range columns {
-		parts = append(parts, fmt.Sprintf("%v", row[col]))
+		parts = append(parts, formatValue(row[col]))
 	}
 	return strings.Join(parts, "\x00")
 }
@@ -630,30 +667,46 @@ func (m *TableManager) SelectByIndex(table, indexName string, colValue interface
 		return nil, err
 	}
 
+	// If no rowids found, return empty result
+	if len(rowids) == 0 {
+		return []Row{}, nil
+	}
+
 	schema, err := m.schema.GetSchema(table)
 	if err != nil {
 		return nil, err
 	}
 
+	// Check if primary key is INTEGER type (in which case rowid == pk)
+	pkCol, _ := schema.GetColumn(schema.PrimaryKey)
+	isPKInteger := pkCol != nil && isIntegerType(pkCol.Type)
+
 	rows := make([]Row, 0, len(rowids))
 	for _, rowid := range rowids {
+		var row Row
+
 		// For INTEGER PRIMARY KEY, the rowid IS the primary key
-		row, err := m.GetByPK(table, fmt.Sprintf("%d", rowid))
-		if err != nil {
-			// Try looking up by _rowid_ if PK lookup fails
-			allRows, _ := m.Select(table, func(r Row) bool {
-				if rid, ok := r["_rowid_"].(float64); ok {
-					return int64(rid) == rowid
-				}
-				return false
-			})
-			if len(allRows) > 0 {
-				rows = append(rows, allRows[0])
+		if isPKInteger {
+			row, err = m.GetByPK(table, fmt.Sprintf("%d", rowid))
+			if err == nil {
+				rows = append(rows, row)
+				continue
 			}
-			continue
 		}
-		_ = schema // Used for validation if needed
-		rows = append(rows, row)
+
+		// For non-INTEGER primary keys or if PK lookup fails, look up by _rowid_
+		allRows, _ := m.Select(table, func(r Row) bool {
+			if rid, ok := r["_rowid_"].(float64); ok {
+				return int64(rid) == rowid
+			}
+			if rid, ok := r["_rowid_"].(int64); ok {
+				return rid == rowid
+			}
+			return false
+		})
+		if len(allRows) > 0 {
+			rows = append(rows, allRows[0])
+		}
 	}
 
 	return rows, nil

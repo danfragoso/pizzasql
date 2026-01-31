@@ -1,0 +1,26 @@
+{
+  "name": "pizzasql",
+  "version": "0.1.0",
+  "description": "PizzaSQL client for JavaScript/TypeScript",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup index.ts --format cjs,esm --dts",
+    "test": "bun test"
+  },
+  "keywords": ["pizzasql", "database", "sql", "client"],
+  "author": "PizzaSQL Team",
+  "license": "MIT",
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}
