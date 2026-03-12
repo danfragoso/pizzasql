@@ -213,7 +213,6 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 	err := m.pool.WithClient(func(c *KVClient) error {
 		var err error
 		values, err = c.Reads(prefix)
-		fmt.Printf("[DEBUG] Select: table=%s, database=%s, prefix=%s, values_count=%d\n", table, m.database, prefix, len(values))
 		return err
 	})
 	if err != nil {
@@ -224,7 +223,6 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 	for _, data := range values {
 		var row Row
 		if err := json.Unmarshal([]byte(data), &row); err != nil {
-			fmt.Printf("[DEBUG] Select: failed to unmarshal row: %v\n", err)
 			continue // Skip invalid rows
 		}
 
@@ -233,7 +231,6 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 		}
 	}
 
-	fmt.Printf("[DEBUG] Select: returning %d rows\n", len(rows))
 	return rows, nil
 }
 

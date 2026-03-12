@@ -2355,6 +2355,18 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 		if fn.Star {
 			return int64(len(rows)), nil
 		}
+		if fn.Distinct {
+			seen := make(map[interface{}]struct{})
+			for _, row := range rows {
+				if len(fn.Args) > 0 {
+					val, _ := e.evalExpr(fn.Args[0], row)
+					if val != nil {
+						seen[val] = struct{}{}
+					}
+				}
+			}
+			return int64(len(seen)), nil
+		}
 		count := int64(0)
 		for _, row := range rows {
 			if len(fn.Args) > 0 {

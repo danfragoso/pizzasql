@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -288,26 +287,19 @@ func (s *Server) handleSchemaTables(w http.ResponseWriter, r *http.Request) {
 	// Get database from X-Database header (trim whitespace)
 	dbName := strings.TrimSpace(r.Header.Get("X-Database"))
 
-	// Debug: Log the header value
-	log.Printf("[DEBUG] /schema/tables - X-Database header: %q", dbName)
-
 	_, schema, err := s.getExecutorForDatabase(dbName)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "DATABASE_ERROR", fmt.Sprintf("database not found: %s", dbName), nil)
 		return
 	}
 
-	// Debug: Log the actual database being used
 	actualDB := schema.GetDatabaseName()
-	log.Printf("[DEBUG] /schema/tables - Resolved to database: %q", actualDB)
 
 	tables, err := schema.ListTables()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "SCHEMA_ERROR", err.Error(), nil)
 		return
 	}
-
-	log.Printf("[DEBUG] /schema/tables - Found %d tables in database %q", len(tables), actualDB)
 
 	// Include the actual database name and requested name in the response for verification
 	resp := map[string]interface{}{

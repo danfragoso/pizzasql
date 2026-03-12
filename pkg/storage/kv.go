@@ -53,7 +53,6 @@ func (c *KVClient) Write(key, value string) error {
 	defer c.mu.Unlock()
 
 	cmd := fmt.Sprintf("write %s|%s\r", key, value)
-	fmt.Printf("[DEBUG KV] Write command (len=%d): key=%q, value_len=%d\n", len(cmd), key, len(value))
 	if _, err := c.writer.WriteString(cmd); err != nil {
 		return fmt.Errorf("write command failed: %w", err)
 	}
@@ -66,7 +65,6 @@ func (c *KVClient) Write(key, value string) error {
 		return fmt.Errorf("read response failed: %w", err)
 	}
 
-	fmt.Printf("[DEBUG KV] Write response: %q\n", resp)
 	resp = strings.TrimSuffix(resp, "\r")
 	if resp != "success" {
 		return fmt.Errorf("write failed: %s", resp)
@@ -81,7 +79,6 @@ func (c *KVClient) Read(key string) (string, error) {
 	defer c.mu.Unlock()
 
 	cmd := fmt.Sprintf("read %s\r", key)
-	fmt.Printf("[DEBUG KV] Read command: %q\n", cmd)
 	if _, err := c.writer.WriteString(cmd); err != nil {
 		return "", fmt.Errorf("read command failed: %w", err)
 	}
@@ -94,7 +91,6 @@ func (c *KVClient) Read(key string) (string, error) {
 		return "", fmt.Errorf("read response failed: %w", err)
 	}
 
-	fmt.Printf("[DEBUG KV] Read raw response: %q\n", resp)
 	resp = strings.TrimSuffix(resp, "\r")
 	if resp == "error" {
 		return "", ErrKeyNotFound
@@ -135,7 +131,6 @@ func (c *KVClient) Reads(prefix string) ([]string, error) {
 	defer c.mu.Unlock()
 
 	cmd := fmt.Sprintf("reads %s\r", prefix)
-	fmt.Printf("[DEBUG KV] Reads command: %q\n", cmd)
 	if _, err := c.writer.WriteString(cmd); err != nil {
 		return nil, fmt.Errorf("reads command failed: %w", err)
 	}
@@ -145,29 +140,22 @@ func (c *KVClient) Reads(prefix string) ([]string, error) {
 
 	resp, err := c.reader.ReadString('\r')
 	if err != nil {
-		fmt.Printf("[DEBUG KV] Reads response error: %v\n", err)
 		return nil, fmt.Errorf("read response failed: %w", err)
 	}
 
-	fmt.Printf("[DEBUG KV] Reads raw response: %q (len=%d)\n", resp, len(resp))
 	resp = strings.TrimSuffix(resp, "\r")
 	if resp == "" {
-		fmt.Printf("[DEBUG KV] Reads: empty response, returning nil\n")
 		return nil, nil
 	}
 
 	values := strings.Split(resp, "\n")
-	fmt.Printf("[DEBUG KV] Reads: split into %d parts\n", len(values))
-	// Filter out empty strings
 	result := make([]string, 0, len(values))
-	for i, v := range values {
-		fmt.Printf("[DEBUG KV] Reads value[%d]: %q\n", i, v)
+	for _, v := range values {
 		if v != "" {
 			result = append(result, v)
 		}
 	}
 
-	fmt.Printf("[DEBUG KV] Reads: returning %d values\n", len(result))
 	return result, nil
 }
 
@@ -251,11 +239,10 @@ func (p *KVPool) Get() (*KVClient, error) {
 			}
 			return client, nil
 		}
-		// Create new connection if stale
+		// Stale connection — replace with a fresh one
 		return NewKVClient(p.addr)
-	default:
-		// Pool empty, create new connection
-		return NewKVClient(p.addr)
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("kv pool timeout: no connection available after 30s")
 	}
 }
 
