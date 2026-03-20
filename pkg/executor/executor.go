@@ -126,8 +126,10 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeDetach(s)
 	}
 
-	// Analyze first
-	if err := e.analyzer.Analyze(stmt); err != nil {
+	// Analyze first — create a fresh analyzer per call so concurrent requests
+	// don't share mutable scope state (e.analyzer.scope would race otherwise).
+	a := analyzer.New(e.catalog)
+	if err := a.Analyze(stmt); err != nil {
 		return nil, err
 	}
 

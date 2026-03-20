@@ -176,7 +176,10 @@ func (a *Analyzer) analyzeSelect(stmt *parser.SelectStmt) error {
 					Message: "SELECT * not allowed with aggregate functions without GROUP BY",
 				}
 			}
-			info, _ := a.analyzeExpr(col.Expr)
+			info, exprErr := a.analyzeExpr(col.Expr)
+			if exprErr != nil || info == nil {
+				continue
+			}
 			if !info.IsAggregate && !info.IsConstant {
 				// Check if it's a simple column reference
 				if ref, ok := col.Expr.(*parser.ColumnRef); ok {
@@ -813,7 +816,9 @@ func (a *Analyzer) analyzeFunctionCall(e *parser.FunctionCall) (*ExprInfo, error
 	// Special case: MIN/MAX/COALESCE return type depends on argument
 	if sig.ReturnType == TypeAny && len(e.Args) > 0 {
 		argInfo, _ := a.analyzeExpr(e.Args[0])
-		info.Type = argInfo.Type
+		if argInfo != nil {
+			info.Type = argInfo.Type
+		}
 	}
 
 	return info, nil

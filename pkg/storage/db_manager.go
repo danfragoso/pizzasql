@@ -2,7 +2,6 @@ package storage
 
 import (
 	"fmt"
-	"log"
 	"sync"
 )
 
@@ -54,10 +53,8 @@ func NewDatabaseManager(pool *KVPool, config *DatabaseManagerConfig) *DatabaseMa
 // If name is empty, returns the default database.
 // If autoCreate is enabled and the database doesn't exist, it will be created.
 func (dm *DatabaseManager) GetDatabase(name string) (*DatabaseInstance, error) {
-	originalName := name
 	if name == "" {
 		name = dm.defaultDatabase
-		log.Printf("[DEBUG] GetDatabase: empty name, using default: %q", name)
 	}
 
 	dm.mu.RLock()
@@ -65,8 +62,6 @@ func (dm *DatabaseManager) GetDatabase(name string) (*DatabaseInstance, error) {
 	dm.mu.RUnlock()
 
 	if exists {
-		log.Printf("[DEBUG] GetDatabase: found existing database %q (requested: %q), schema.database=%q",
-			name, originalName, db.Schema.GetDatabaseName())
 		return db, nil
 	}
 
@@ -74,7 +69,6 @@ func (dm *DatabaseManager) GetDatabase(name string) (*DatabaseInstance, error) {
 		return nil, fmt.Errorf("database not found: %s", name)
 	}
 
-	log.Printf("[DEBUG] GetDatabase: creating new database %q (requested: %q)", name, originalName)
 	return dm.getOrCreateDatabase(name), nil
 }
 
