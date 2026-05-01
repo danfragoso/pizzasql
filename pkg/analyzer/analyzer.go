@@ -415,7 +415,7 @@ func (a *Analyzer) analyzeInsert(stmt *parser.InsertStmt) error {
 
 	// Analyze INSERT ... SELECT
 	if stmt.Select != nil {
-		a.scope.DefineTable(&TableInfo{Name: table.Name, Columns: table.Columns})
+		a.scope.DefineTable(&TableInfo{Name: table.Name, Columns: table.Columns, IsView: table.IsView})
 		if err := a.analyzeSelect(stmt.Select); err != nil {
 			return err
 		}
@@ -434,7 +434,7 @@ func (a *Analyzer) analyzeUpdate(stmt *parser.UpdateStmt) error {
 		}
 	}
 
-	a.scope.DefineTable(&TableInfo{Name: table.Name, Columns: table.Columns, Alias: stmt.Table.Alias})
+	a.scope.DefineTable(&TableInfo{Name: table.Name, Columns: table.Columns, Alias: stmt.Table.Alias, IsView: table.IsView})
 
 	// Validate SET assignments
 	for _, assign := range stmt.Set {
@@ -487,7 +487,7 @@ func (a *Analyzer) analyzeDelete(stmt *parser.DeleteStmt) error {
 		}
 	}
 
-	a.scope.DefineTable(&TableInfo{Name: table.Name, Columns: table.Columns})
+	a.scope.DefineTable(&TableInfo{Name: table.Name, Columns: table.Columns, IsView: table.IsView})
 
 	// Analyze WHERE clause
 	if stmt.Where != nil {
@@ -747,12 +747,15 @@ func (a *Analyzer) analyzeUnaryExpr(e *parser.UnaryExpr) (*ExprInfo, error) {
 	}
 
 	switch e.Op {
-	case lexer.TokenMinus, lexer.TokenPlus:
+	case lexer.TokenPlus:
+		// Unary + is a no-op in SQLite — passes any type through unchanged.
+		info.Type = operand.Type
+	case lexer.TokenMinus:
 		info.Type = operand.Type
 		if !operand.Type.IsNumeric() && operand.Type != TypeNull && operand.Type != TypeUnknown {
 			return nil, &AnalysisError{
 				Type:    ErrTypeMismatch,
-				Message: fmt.Sprintf("unary %s requires numeric type, got %s", e.Op, operand.Type),
+				Message: fmt.Sprintf("unary - requires numeric type, got %s", operand.Type),
 			}
 		}
 	case lexer.TokenNOT:

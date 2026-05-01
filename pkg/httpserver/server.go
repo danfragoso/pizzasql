@@ -22,6 +22,7 @@ type Config struct {
 	EnableCORS        bool
 	EnableAuth        bool
 	EnableCompression bool
+	EnableLogging     bool
 	APIKeys           []string
 	TLSCertFile       string
 	TLSKeyFile        string
@@ -38,6 +39,7 @@ func DefaultConfig() *Config {
 		EnableCORS:        true,
 		EnableAuth:        false,
 		EnableCompression: true,
+		EnableLogging:     true,
 		APIKeys:           []string{},
 	}
 }
@@ -138,7 +140,9 @@ func (s *Server) init() *Server {
 		handler = s.authMiddleware(handler)
 	}
 
-	handler = s.loggingMiddleware(handler)
+	if s.config.EnableLogging {
+		handler = s.loggingMiddleware(handler)
+	}
 
 	// Register routes
 	mux.HandleFunc("/query", s.handleQuery)

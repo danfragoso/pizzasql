@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Row represents a database row.
@@ -14,6 +15,9 @@ type TableManager struct {
 	pool     *KVPool
 	schema   *SchemaManager
 	database string
+
+	cacheMu  sync.RWMutex
+	rowCache map[string][]Row // table name → all rows (nil means not loaded)
 }
 
 // NewTableManager creates a new table manager.
@@ -22,7 +26,20 @@ func NewTableManager(pool *KVPool, schema *SchemaManager, database string) *Tabl
 		pool:     pool,
 		schema:   schema,
 		database: database,
+		rowCache: make(map[string][]Row),
 	}
+}
+
+// invalidateCache removes a table's rows from the in-memory cache.
+func (m *TableManager) invalidateCache(table string) {
+	m.cacheMu.Lock()
+	delete(m.rowCache, strings.ToLower(table))
+	m.cacheMu.Unlock()
+}
+
+// InvalidateCache is the exported version for use by the executor.
+func (m *TableManager) InvalidateCache(table string) {
+	m.invalidateCache(table)
 }
 
 // dataKey returns the key for a row.
@@ -167,7 +184,177 @@ func (m *TableManager) Insert(table string, row Row) error {
 	// Update indexes
 	m.updateIndexesForRow(table, normalizedRow, true)
 
+	m.invalidateCache(table)
 	return nil
+}
+
+// InsertBulk inserts multiple rows efficiently, parallelizing KV writes across
+// the connection pool. Skips per-row duplicate checks (caller must ensure
+// uniqueness). Used by INSERT ... SELECT.
+func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	schema, err := m.schema.GetSchema(table)
+	if err != nil {
+		return 0, err
+	}
+
+	pkCol, _ := schema.GetColumn(schema.PrimaryKey)
+	isIntegerPK := pkCol != nil && isIntegerType(pkCol.Type)
+
+	// Normalize rows and assign _rowid_.
+	normalized := make([]Row, 0, len(rows))
+	var maxRowID int64
+	for _, row := range rows {
+		nr := make(Row)
+		for _, col := range schema.Columns {
+			for k, v := range row {
+				if strings.EqualFold(k, col.Name) {
+					nr[col.Name] = v
+					break
+				}
+			}
+		}
+		for _, col := range schema.Columns {
+			if _, ok := nr[col.Name]; !ok && col.Default != nil {
+				nr[col.Name] = col.Default
+			}
+		}
+		var rowid int64
+		var hasRowid bool
+		if isIntegerPK {
+			switch v := nr[schema.PrimaryKey].(type) {
+			case float64:
+				rowid = int64(v)
+				hasRowid = true
+			case int64:
+				rowid = v
+				hasRowid = true
+			case int:
+				rowid = int64(v)
+				hasRowid = true
+			}
+		}
+		if !hasRowid {
+			// Fall back to sequential insert for non-integer-pk rows.
+			if err := m.Insert(table, row); err != nil {
+				return len(normalized), err
+			}
+			continue
+		}
+		nr["_rowid_"] = rowid
+		if rowid > maxRowID {
+			maxRowID = rowid
+		}
+		normalized = append(normalized, nr)
+	}
+
+	if maxRowID > 0 {
+		m.schema.UpdateMaxRowID(table, maxRowID)
+	}
+
+	// Serialize all rows.
+	type kv struct{ key, val string }
+	rowKVs := make([]kv, 0, len(normalized))
+	for _, nr := range normalized {
+		pk := fmt.Sprintf("%v", nr[schema.PrimaryKey])
+		data, err := json.Marshal(nr)
+		if err != nil {
+			return 0, err
+		}
+		rowKVs = append(rowKVs, kv{m.dataKey(table, pk), string(data)})
+	}
+
+	// Write rows concurrently.
+	errs := make([]error, len(rowKVs))
+	var wg sync.WaitGroup
+	for i, w := range rowKVs {
+		wg.Add(1)
+		i, w := i, w
+		go func() {
+			defer wg.Done()
+			errs[i] = m.pool.WithClient(func(c *KVClient) error {
+				return c.Write(w.key, w.val)
+			})
+		}()
+	}
+	wg.Wait()
+	for _, e := range errs {
+		if e != nil {
+			return 0, e
+		}
+	}
+
+	// Build index entries grouped by key (to avoid read-merge races).
+	indexes, _ := m.schema.ListTableIndexes(table)
+	if len(indexes) > 0 {
+		// For each index, gather {indexKey → []rowid} from the new rows.
+		type indexEntry struct {
+			key    string
+			rowids []int64
+		}
+		var entries []indexEntry
+
+		for _, idx := range indexes {
+			cols := make([]string, len(idx.Columns))
+			for i, c := range idx.Columns {
+				cols[i] = c.Name
+			}
+			byKey := make(map[string][]int64)
+			for _, nr := range normalized {
+				colVal := m.buildIndexValue(nr, cols)
+				ikey := m.indexEntryKey(idx.Name, colVal)
+				var rowid int64
+				switch v := nr["_rowid_"].(type) {
+				case int64:
+					rowid = v
+				case float64:
+					rowid = int64(v)
+				}
+				byKey[ikey] = append(byKey[ikey], rowid)
+			}
+			for k, rs := range byKey {
+				entries = append(entries, indexEntry{k, rs})
+			}
+		}
+
+		// Write index entries concurrently; each key is handled by exactly
+		// one goroutine so there's no merge race.
+		ieErrs := make([]error, len(entries))
+		var iwg sync.WaitGroup
+		for i, e := range entries {
+			iwg.Add(1)
+			i, e := i, e
+			go func() {
+				defer iwg.Done()
+				// Merge with any existing rowids for this key.
+				var existing []int64
+				m.pool.WithClient(func(c *KVClient) error {
+					data, err := c.Read(e.key)
+					if err == nil {
+						json.Unmarshal([]byte(data), &existing)
+					}
+					return nil
+				})
+				merged := append(existing, e.rowids...)
+				data, _ := json.Marshal(merged)
+				ieErrs[i] = m.pool.WithClient(func(c *KVClient) error {
+					return c.Write(e.key, string(data))
+				})
+			}()
+		}
+		iwg.Wait()
+		for _, e := range ieErrs {
+			if e != nil {
+				return 0, e
+			}
+		}
+	}
+
+	m.invalidateCache(table)
+	return len(normalized), nil
 }
 
 // updateIndexesForRow adds or removes index entries for a row.
@@ -207,30 +394,52 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 		return nil, fmt.Errorf("table not found: %s", table)
 	}
 
-	prefix := m.dataPrefix(table)
-	var values []string
+	key := strings.ToLower(table)
 
-	err := m.pool.WithClient(func(c *KVClient) error {
-		var err error
-		values, err = c.Reads(prefix)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
+	m.cacheMu.RLock()
+	cached, ok := m.rowCache[key]
+	m.cacheMu.RUnlock()
 
-	rows := make([]Row, 0, len(values))
-	for _, data := range values {
-		var row Row
-		if err := json.Unmarshal([]byte(data), &row); err != nil {
-			continue // Skip invalid rows
+	if !ok {
+		prefix := m.dataPrefix(table)
+		var values []string
+		err := m.pool.WithClient(func(c *KVClient) error {
+			var err error
+			values, err = c.Reads(prefix)
+			return err
+		})
+		if err != nil {
+			return nil, err
 		}
 
-		if filter == nil || filter(row) {
+		loaded := make([]Row, 0, len(values))
+		for _, data := range values {
+			var row Row
+			if err := json.Unmarshal([]byte(data), &row); err != nil {
+				continue
+			}
+			loaded = append(loaded, row)
+		}
+
+		m.cacheMu.Lock()
+		m.rowCache[key] = loaded
+		m.cacheMu.Unlock()
+
+		cached = loaded
+	}
+
+	if filter == nil {
+		result := make([]Row, len(cached))
+		copy(result, cached)
+		return result, nil
+	}
+
+	rows := make([]Row, 0, len(cached))
+	for _, row := range cached {
+		if filter(row) {
 			rows = append(rows, row)
 		}
 	}
-
 	return rows, nil
 }
 
@@ -308,6 +517,7 @@ func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) 
 		}
 	}
 
+	m.invalidateCache(table)
 	return count, nil
 }
 
@@ -369,6 +579,7 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 		}
 	}
 
+	m.invalidateCache(table)
 	return count, nil
 }
 
@@ -402,6 +613,7 @@ func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) 
 		}
 	}
 
+	m.invalidateCache(table)
 	return count, nil
 }
 
@@ -669,42 +881,24 @@ func (m *TableManager) SelectByIndex(table, indexName string, colValue interface
 		return []Row{}, nil
 	}
 
-	schema, err := m.schema.GetSchema(table)
-	if err != nil {
-		return nil, err
+	// Build a set of target rowids for O(1) lookup.
+	rowidSet := make(map[int64]struct{}, len(rowids))
+	for _, rid := range rowids {
+		rowidSet[rid] = struct{}{}
 	}
-
-	// Check if primary key is INTEGER type (in which case rowid == pk)
-	pkCol, _ := schema.GetColumn(schema.PrimaryKey)
-	isPKInteger := pkCol != nil && isIntegerType(pkCol.Type)
-
-	rows := make([]Row, 0, len(rowids))
-	for _, rowid := range rowids {
-		var row Row
-
-		// For INTEGER PRIMARY KEY, the rowid IS the primary key
-		if isPKInteger {
-			row, err = m.GetByPK(table, fmt.Sprintf("%d", rowid))
-			if err == nil {
-				rows = append(rows, row)
-				continue
-			}
+	allRows, _ := m.Select(table, func(r Row) bool {
+		switch v := r["_rowid_"].(type) {
+		case float64:
+			_, ok := rowidSet[int64(v)]
+			return ok
+		case int64:
+			_, ok := rowidSet[v]
+			return ok
 		}
+		return false
+	})
 
-		// For non-INTEGER primary keys or if PK lookup fails, look up by _rowid_
-		allRows, _ := m.Select(table, func(r Row) bool {
-			if rid, ok := r["_rowid_"].(float64); ok {
-				return int64(rid) == rowid
-			}
-			if rid, ok := r["_rowid_"].(int64); ok {
-				return rid == rowid
-			}
-			return false
-		})
-		if len(allRows) > 0 {
-			rows = append(rows, allRows[0])
-		}
-	}
+	rows := allRows
 
 	return rows, nil
 }

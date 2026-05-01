@@ -33,6 +33,7 @@ var (
 	httpPort   = flag.Int("http-port", 8080, "HTTP server port")
 	httpCORS   = flag.Bool("http-cors", true, "Enable CORS")
 	httpAuth   = flag.Bool("http-auth", false, "Enable authentication")
+	httpQuiet  = flag.Bool("quiet", false, "Disable request logging")
 	apiKeys    = flag.String("api-keys", "", "Comma-separated API keys")
 
 	// Export/Import flags
@@ -723,6 +724,7 @@ func runHTTPServer() {
 	config.Port = *httpPort
 	config.EnableCORS = *httpCORS
 	config.EnableAuth = *httpAuth
+	config.EnableLogging = !*httpQuiet
 
 	if *apiKeys != "" {
 		config.APIKeys = strings.Split(*apiKeys, ",")

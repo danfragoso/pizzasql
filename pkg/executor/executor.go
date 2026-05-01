@@ -31,6 +31,13 @@ type Executor struct {
 
 	// Subquery context for correlated subqueries
 	outerRow storage.Row
+
+	// Per-query cache for non-correlated IN (SELECT ...) subquery results.
+	// Keyed by subquery AST pointer; valid for one top-level Execute call.
+	subqueryCache map[*parser.SelectStmt]*Result
+
+	// In-memory view registry: view name (lowercase) → SELECT AST.
+	views map[string]*parser.SelectStmt
 }
 
 // DatabaseConnection represents an attached database.
@@ -59,6 +66,7 @@ func New(schema *storage.SchemaManager, table *storage.TableManager) *Executor {
 		catalog:           catalog,
 		attachedDatabases: make(map[string]*DatabaseConnection),
 		currentDatabase:   "main",
+		views:             make(map[string]*parser.SelectStmt),
 	}
 
 	// Register the main database
@@ -94,6 +102,9 @@ func (e *Executor) SyncCatalog() error {
 
 // Execute executes a SQL statement.
 func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
+	e.subqueryCache = make(map[*parser.SelectStmt]*Result)
+	defer func() { e.subqueryCache = nil }()
+
 	// PRAGMA doesn't need analysis
 	if pragma, ok := stmt.(*parser.PragmaStmt); ok {
 		return e.executePragma(pragma)
@@ -120,6 +131,10 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeCreateIndex(s)
 	case *parser.DropIndexStmt:
 		return e.executeDropIndex(s)
+	case *parser.CreateViewStmt:
+		return e.executeCreateView(s)
+	case *parser.DropViewStmt:
+		return e.executeDropView(s)
 	case *parser.AttachStmt:
 		return e.executeAttach(s)
 	case *parser.DetachStmt:
@@ -157,8 +172,11 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	}
 }
 
-// executeSelect executes a SELECT statement.
+// executeSelect executes a SELECT statement (or compound SELECT).
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	if stmt.Compound != nil {
+		return e.executeCompound(stmt.Compound)
+	}
 	if len(stmt.From) == 0 {
 		// SELECT without FROM (e.g., SELECT 1+1)
 		return e.executeSelectExpr(stmt)
@@ -170,16 +188,35 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	}
 
 	tableName := stmt.From[0].Name
+
+	// Transparently expand view references as derived-table subqueries.
+	if viewDef, ok := e.views[strings.ToLower(tableName)]; ok {
+		alias := stmt.From[0].Alias
+		if alias == "" {
+			alias = tableName
+		}
+		modifiedStmt := *stmt
+		modifiedFrom := make([]parser.TableRef, len(stmt.From))
+		copy(modifiedFrom, stmt.From)
+		modifiedFrom[0] = parser.TableRef{Subquery: viewDef, Alias: alias}
+		modifiedStmt.From = modifiedFrom
+		return e.executeSelectFromSubquery(&modifiedStmt)
+	}
+
 	schema, err := e.schema.GetSchema(tableName)
 	if err != nil {
 		return nil, err
 	}
 
-	// Try to use index for WHERE clause
+	// Multi-table FROM (comma-separated implicit cross join): collect and cross join all tables,
+	// then apply WHERE after. Don't push WHERE down here — conditions reference multiple tables.
+	isMultiTable := len(stmt.From) > 1 && stmt.From[0].Join == nil
+
+	// Try to use index for WHERE clause (single-table only)
 	var rows []storage.Row
 	usedIndex := false
 
-	if stmt.Where != nil {
+	if stmt.Where != nil && !isMultiTable {
 		// Check if we can use an index
 		colName, colValue, isEquality := e.extractIndexableCondition(stmt.Where)
 		if isEquality {
@@ -200,53 +237,504 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	// Fall back to full table scan if no index used
 	if !usedIndex {
-		// Build filter function from WHERE clause
-		// Only use filter during scan if there's NO alias (otherwise the filter won't have the right column names)
+		var filterErr error
 		var filter func(storage.Row) bool
-		if stmt.Where != nil && stmt.From[0].Alias == "" {
+		if stmt.Where != nil && stmt.From[0].Alias == "" && !isMultiTable {
 			filter = func(row storage.Row) bool {
-				val, err := e.evalExpr(stmt.Where, row)
-				if err != nil {
+				val, ferr := e.evalExpr(stmt.Where, row)
+				if ferr != nil {
+					filterErr = ferr
 					return false
 				}
 				return toBool(val)
 			}
 		}
-
 		rows, err = e.table.Select(tableName, filter)
+		if filterErr != nil {
+			return nil, filterErr
+		}
 	}
 	if err != nil {
 		return nil, err
 	}
 
 	// Add table alias to rows if there's an explicit alias
-	// This needs to happen BEFORE filtering so that the WHERE clause can reference the alias
 	if stmt.From[0].Alias != "" {
 		for i := range rows {
 			rows[i] = e.addTableAlias(rows[i], stmt.From[0].Alias)
 		}
+	} else if isMultiTable {
+		// For multi-table cross joins without alias, prefix columns with table name
+		// so WHERE can distinguish t3.a3 from t7.a7.
+		for i := range rows {
+			rows[i] = e.addTableAlias(rows[i], tableName)
+		}
 	}
 
-	// Apply WHERE clause filter if we have an alias (we couldn't filter during scan)
-	if stmt.Where != nil && stmt.From[0].Alias != "" {
+	// Apply WHERE for single-table with alias (after alias mapping so alias.col refs work)
+	if stmt.Where != nil && stmt.From[0].Alias != "" && !isMultiTable {
+		var filterErr error
 		var filtered []storage.Row
 		for _, row := range rows {
-			val, err := e.evalExpr(stmt.Where, row)
-			if err != nil {
-				continue // Skip rows that error
+			val, ferr := e.evalExpr(stmt.Where, row)
+			if ferr != nil {
+				filterErr = ferr
+				break
 			}
 			if toBool(val) {
 				filtered = append(filtered, row)
 			}
 		}
+		if filterErr != nil {
+			return nil, filterErr
+		}
 		rows = filtered
 	}
 
-	// Handle JOINs
+	// Handle explicit JOINs
 	if len(stmt.From) > 0 && stmt.From[0].Join != nil {
 		rows, err = e.executeJoins(stmt.From[0], rows)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// Handle implicit cross joins (comma-separated FROM tables)
+	if isMultiTable {
+		// Build the column-set for each table so we can push WHERE conditions down.
+		type tableInfo struct {
+			alias   string
+			name    string
+			colsSet map[string]bool // lower-case column names for this table
+		}
+
+		allTableInfos := make([]tableInfo, len(stmt.From))
+		for i, tref := range stmt.From {
+			alias := tref.Alias
+			if alias == "" {
+				alias = tref.Name
+			}
+			sch, _ := e.schema.GetSchema(tref.Name)
+			cols := map[string]bool{}
+			if sch != nil {
+				for _, c := range sch.Columns {
+					cols[strings.ToLower(c.Name)] = true
+				}
+			}
+			allTableInfos[i] = tableInfo{alias: alias, name: tref.Name, colsSet: cols}
+		}
+
+		// Split WHERE into AND-clauses and determine which tables each clause touches.
+		var andClauses []parser.Expr
+		if stmt.Where != nil {
+			andClauses = splitANDClauses(stmt.Where)
+		}
+
+		// For each table, collect conditions that reference only its own columns.
+		tableFilters := make([][]parser.Expr, len(stmt.From))
+		var crossFilters []parser.Expr
+		for _, clause := range andClauses {
+			refs := collectColumnRefs(clause)
+			ownerIdx := -1
+			cross := false
+			for _, ref := range refs {
+				colLower := strings.ToLower(ref)
+				found := -1
+				for i, ti := range allTableInfos {
+					if ti.colsSet[colLower] {
+						if found == -1 {
+							found = i
+						} else if found != i {
+							cross = true
+							break
+						}
+					}
+				}
+				if cross {
+					break
+				}
+				if found != -1 {
+					if ownerIdx == -1 {
+						ownerIdx = found
+					} else if ownerIdx != found {
+						cross = true
+						break
+					}
+				}
+			}
+			if cross || ownerIdx == -1 {
+				crossFilters = append(crossFilters, clause)
+			} else {
+				tableFilters[ownerIdx] = append(tableFilters[ownerIdx], clause)
+			}
+		}
+
+		// Build cross-condition adjacency: for each cross filter, record which table indices it touches.
+		type crossEdge struct{ a, b int }
+		var crossEdges []crossEdge
+		for _, clause := range crossFilters {
+			refs := collectColumnRefs(clause)
+			touched := map[int]bool{}
+			for _, ref := range refs {
+				cl := strings.ToLower(ref)
+				for j, ti := range allTableInfos {
+					if ti.colsSet[cl] {
+						touched[j] = true
+					}
+				}
+			}
+			idxs := make([]int, 0, len(touched))
+			for j := range touched {
+				idxs = append(idxs, j)
+			}
+			if len(idxs) == 2 {
+				crossEdges = append(crossEdges, crossEdge{idxs[0], idxs[1]})
+			}
+		}
+
+		// Helper: find cross-conditions applicable when seenSet is fully present.
+		applyWhenSeen := func(seenSet map[int]bool, pending []parser.Expr) (applicable, still []parser.Expr) {
+			for _, clause := range pending {
+				refs := collectColumnRefs(clause)
+				ok := true
+				for _, ref := range refs {
+					cl := strings.ToLower(ref)
+					found := false
+					for j, tti := range allTableInfos {
+						if tti.colsSet[cl] && seenSet[j] {
+							found = true
+							break
+						}
+					}
+					if !found {
+						ok = false
+						break
+					}
+				}
+				if ok {
+					applicable = append(applicable, clause)
+				} else {
+					still = append(still, clause)
+				}
+			}
+			return
+		}
+
+		// Helper: inline cross-join two row-sets, applying a predicate.
+		inlineJoin := func(left, right []storage.Row, pred parser.Expr) []storage.Row {
+			out := make([]storage.Row, 0, len(left))
+			for _, l := range left {
+				for _, r := range right {
+					m := make(storage.Row, len(l)+len(r))
+					for k, v := range l {
+						m[k] = v
+					}
+					for k, v := range r {
+						m[k] = v
+					}
+					if pred != nil {
+						val, _ := e.evalExpr(pred, m)
+						if !toBool(val) {
+							continue
+						}
+					}
+					out = append(out, m)
+				}
+			}
+			return out
+		}
+
+		// Pre-join connected components of "cross-only" tables (0 single-table filters,
+		// connected via cross conditions to other cross-only tables).
+		// This prevents n^k explosions when bare tables are joined last.
+		crossOnlySet := map[int]bool{}
+		for i := range stmt.From {
+			if len(tableFilters[i]) > 0 {
+				continue
+			}
+			for _, ce := range crossEdges {
+				if ce.a == i || ce.b == i {
+					crossOnlySet[i] = true
+					break
+				}
+			}
+		}
+
+		// BFS: find connected components among cross-only tables.
+		compOf := make([]int, len(stmt.From))
+		for i := range compOf {
+			compOf[i] = -1
+		}
+		nComps := 0
+		for start := range stmt.From {
+			if !crossOnlySet[start] || compOf[start] != -1 {
+				continue
+			}
+			queue := []int{start}
+			compOf[start] = nComps
+			for len(queue) > 0 {
+				cur := queue[0]
+				queue = queue[1:]
+				for _, ce := range crossEdges {
+					var nb int = -1
+					if ce.a == cur && crossOnlySet[ce.b] {
+						nb = ce.b
+					} else if ce.b == cur && crossOnlySet[ce.a] {
+						nb = ce.a
+					}
+					if nb >= 0 && compOf[nb] == -1 {
+						compOf[nb] = nComps
+						queue = append(queue, nb)
+					}
+				}
+			}
+			nComps++
+		}
+
+		// Group cross-only tables by component.
+		compTbls := make([][]int, nComps)
+		for i, c := range compOf {
+			if c >= 0 {
+				compTbls[c] = append(compTbls[c], i)
+			}
+		}
+
+		// Pre-join each component with ≥2 tables; collect results as virtual units.
+		type virtualUnit struct {
+			tableIdxs map[int]bool
+			rows      []storage.Row
+		}
+		var virtuals []virtualUnit
+		preJoined := map[int]bool{} // original table indices consumed into virtuals
+		remaining := make([]parser.Expr, len(crossFilters))
+		copy(remaining, crossFilters)
+
+		for _, comp := range compTbls {
+			if len(comp) < 2 {
+				continue
+			}
+			// Pick seed: table with most cross-edges within component.
+			seed := comp[0]
+			for _, idx := range comp[1:] {
+				degIdx, degSeed := 0, 0
+				for _, ce := range crossEdges {
+					if (ce.a == idx || ce.b == idx) {
+						degIdx++
+					}
+					if (ce.a == seed || ce.b == seed) {
+						degSeed++
+					}
+				}
+				if degIdx > degSeed {
+					seed = idx
+				}
+			}
+
+			// Load seed.
+			seedRows, rerr := e.table.Select(stmt.From[seed].Name, nil)
+			if rerr != nil {
+				return nil, rerr
+			}
+			for j := range seedRows {
+				seedRows[j] = e.addTableAlias(seedRows[j], allTableInfos[seed].alias)
+			}
+			vSeen := map[int]bool{seed: true}
+
+			// Greedy within-component join.
+			compSet := map[int]bool{}
+			for _, idx := range comp {
+				compSet[idx] = true
+			}
+			for len(vSeen) < len(comp) {
+				// Pick next table in component with cross-edge to vSeen.
+				nextC := -1
+				for _, idx := range comp {
+					if vSeen[idx] {
+						continue
+					}
+					for _, ce := range crossEdges {
+						if (ce.a == idx && vSeen[ce.b]) || (ce.b == idx && vSeen[ce.a]) {
+							nextC = idx
+							break
+						}
+					}
+					if nextC >= 0 {
+						break
+					}
+				}
+				if nextC < 0 {
+					for _, idx := range comp {
+						if !vSeen[idx] {
+							nextC = idx
+							break
+						}
+					}
+				}
+
+				nextRows, rerr := e.table.Select(stmt.From[nextC].Name, nil)
+				if rerr != nil {
+					return nil, rerr
+				}
+				for j := range nextRows {
+					nextRows[j] = e.addTableAlias(nextRows[j], allTableInfos[nextC].alias)
+				}
+				vSeen[nextC] = true
+
+				appl, still := applyWhenSeen(vSeen, remaining)
+				remaining = still
+				var pred parser.Expr
+				if len(appl) > 0 {
+					pred = combineAND(appl)
+				}
+				seedRows = inlineJoin(seedRows, nextRows, pred)
+			}
+
+			virtuals = append(virtuals, virtualUnit{tableIdxs: vSeen, rows: seedRows})
+			for idx := range vSeen {
+				preJoined[idx] = true
+			}
+		}
+
+		// Build greedy order for non-pre-joined tables.
+		// Score: single-table filter count + 1000 × cross-edges to already-joined.
+		orderNonPJ := make([]int, 0, len(stmt.From)-len(preJoined))
+		inOrderNPJ := make([]bool, len(stmt.From))
+
+		best := -1
+		for j := range stmt.From {
+			if preJoined[j] {
+				continue
+			}
+			if best < 0 || len(tableFilters[j]) > len(tableFilters[best]) {
+				best = j
+			}
+		}
+		if best >= 0 {
+			orderNonPJ = append(orderNonPJ, best)
+			inOrderNPJ[best] = true
+		}
+		for len(orderNonPJ)+len(preJoined) < len(stmt.From) {
+			joined := map[int]bool{}
+			for _, idx := range orderNonPJ {
+				joined[idx] = true
+			}
+			nextIdx := -1
+			nextScore := -1
+			for j := range stmt.From {
+				if inOrderNPJ[j] || preJoined[j] {
+					continue
+				}
+				score := len(tableFilters[j])
+				for _, ce := range crossEdges {
+					if (ce.a == j && joined[ce.b]) || (ce.b == j && joined[ce.a]) {
+						score += 1000
+					}
+				}
+				if score > nextScore {
+					nextScore = score
+					nextIdx = j
+				}
+			}
+			if nextIdx < 0 {
+				for j := range stmt.From {
+					if !inOrderNPJ[j] && !preJoined[j] {
+						nextIdx = j
+						break
+					}
+				}
+			}
+			if nextIdx >= 0 {
+				orderNonPJ = append(orderNonPJ, nextIdx)
+				inOrderNPJ[nextIdx] = true
+			}
+		}
+
+		// Load the initial rows for the first non-pre-joined table (or use the already-loaded rows).
+		seenTables := map[int]bool{}
+		if len(orderNonPJ) > 0 {
+			first := orderNonPJ[0]
+			if first != 0 {
+				rows, err = e.table.Select(stmt.From[first].Name, nil)
+				if err != nil {
+					return nil, err
+				}
+				for i := range rows {
+					rows[i] = e.addTableAlias(rows[i], allTableInfos[first].alias)
+				}
+			}
+			if len(tableFilters[first]) > 0 {
+				pred := combineAND(tableFilters[first])
+				var filtered []storage.Row
+				for _, row := range rows {
+					val, _ := e.evalExpr(pred, row)
+					if toBool(val) {
+						filtered = append(filtered, row)
+					}
+				}
+				rows = filtered
+			}
+			seenTables[first] = true
+
+			// Join remaining non-pre-joined tables.
+			for _, idx := range orderNonPJ[1:] {
+				ti := allTableInfos[idx]
+				rightRows, rerr := e.table.Select(stmt.From[idx].Name, nil)
+				if rerr != nil {
+					return nil, rerr
+				}
+				for j := range rightRows {
+					rightRows[j] = e.addTableAlias(rightRows[j], ti.alias)
+				}
+				if len(tableFilters[idx]) > 0 {
+					pred := combineAND(tableFilters[idx])
+					var filtered []storage.Row
+					for _, row := range rightRows {
+						val, _ := e.evalExpr(pred, row)
+						if toBool(val) {
+							filtered = append(filtered, row)
+						}
+					}
+					rightRows = filtered
+				}
+				seenTables[idx] = true
+				appl, still := applyWhenSeen(seenTables, remaining)
+				remaining = still
+				var pred parser.Expr
+				if len(appl) > 0 {
+					pred = combineAND(appl)
+				}
+				rows = inlineJoin(rows, rightRows, pred)
+			}
+		} else {
+			// All tables were pre-joined; start with empty placeholder.
+			rows = []storage.Row{{}}
+		}
+
+		// Integrate virtual (pre-joined) units into the result.
+		for _, vu := range virtuals {
+			for idx := range vu.tableIdxs {
+				seenTables[idx] = true
+			}
+			appl, still := applyWhenSeen(seenTables, remaining)
+			remaining = still
+			var pred parser.Expr
+			if len(appl) > 0 {
+				pred = combineAND(appl)
+			}
+			rows = inlineJoin(rows, vu.rows, pred)
+		}
+
+		// Apply any remaining conditions (shouldn't normally happen).
+		if len(remaining) > 0 {
+			pred := combineAND(remaining)
+			var filtered []storage.Row
+			for _, row := range rows {
+				val, _ := e.evalExpr(pred, row)
+				if toBool(val) {
+					filtered = append(filtered, row)
+				}
+			}
+			rows = filtered
 		}
 	}
 
@@ -263,7 +751,7 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	// Apply ORDER BY
 	if len(stmt.OrderBy) > 0 {
-		e.sortRows(rows, stmt.OrderBy)
+		e.sortRows(rows, resolveOrderByPositions(stmt.OrderBy, stmt.Columns))
 	}
 
 	// Apply LIMIT/OFFSET
@@ -329,6 +817,114 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	// Apply DISTINCT if specified
 	if stmt.Distinct {
 		result.Rows = e.applyDistinct(result.Rows)
+	}
+
+	return result, nil
+}
+
+// executeCompound executes a compound SELECT (UNION / UNION ALL / INTERSECT / EXCEPT).
+func (e *Executor) executeCompound(c *parser.CompoundSelect) (*Result, error) {
+	left, err := e.executeSelect(c.Left)
+	if err != nil {
+		return nil, err
+	}
+	right, err := e.executeSelect(c.Right)
+	if err != nil {
+		return nil, err
+	}
+
+	rowKey := func(row []interface{}) string {
+		parts := make([]string, len(row))
+		for i, v := range row {
+			if v == nil {
+				parts[i] = "\x00NULL"
+			} else {
+				parts[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		return strings.Join(parts, "\x01")
+	}
+
+	result := NewResult("SELECT")
+	for _, col := range left.Columns {
+		result.AddColumn(col)
+	}
+
+	switch c.Op {
+	case parser.SetOpUnion:
+		seen := map[string]bool{}
+		for _, row := range left.Rows {
+			k := rowKey(row)
+			if !seen[k] {
+				seen[k] = true
+				result.AddRow(row...)
+			}
+		}
+		for _, row := range right.Rows {
+			k := rowKey(row)
+			if !seen[k] {
+				seen[k] = true
+				result.AddRow(row...)
+			}
+		}
+	case parser.SetOpUnionAll:
+		for _, row := range left.Rows {
+			result.AddRow(row...)
+		}
+		for _, row := range right.Rows {
+			result.AddRow(row...)
+		}
+	case parser.SetOpIntersect:
+		rightSet := map[string]bool{}
+		for _, row := range right.Rows {
+			rightSet[rowKey(row)] = true
+		}
+		seen := map[string]bool{}
+		for _, row := range left.Rows {
+			k := rowKey(row)
+			if rightSet[k] && !seen[k] {
+				seen[k] = true
+				result.AddRow(row...)
+			}
+		}
+	case parser.SetOpExcept:
+		rightSet := map[string]bool{}
+		for _, row := range right.Rows {
+			rightSet[rowKey(row)] = true
+		}
+		seen := map[string]bool{}
+		for _, row := range left.Rows {
+			k := rowKey(row)
+			if !rightSet[k] && !seen[k] {
+				seen[k] = true
+				result.AddRow(row...)
+			}
+		}
+	}
+
+	// Apply compound-level ORDER BY / LIMIT / OFFSET if present.
+	if len(c.OrderBy) > 0 {
+		e.sortResultRows(result, c.OrderBy, nil, nil)
+	}
+	if c.Limit != nil {
+		limitVal, err := e.evalExpr(c.Limit, nil)
+		if err == nil {
+			limit := int(toFloat(limitVal))
+			if limit < len(result.Rows) {
+				result.Rows = result.Rows[:limit]
+			}
+		}
+	}
+	if c.Offset != nil {
+		offsetVal, err := e.evalExpr(c.Offset, nil)
+		if err == nil {
+			offset := int(toFloat(offsetVal))
+			if offset >= len(result.Rows) {
+				result.Rows = nil
+			} else if offset > 0 {
+				result.Rows = result.Rows[offset:]
+			}
+		}
 	}
 
 	return result, nil
@@ -436,7 +1032,7 @@ func (e *Executor) executeSelectFromSubquery(stmt *parser.SelectStmt) (*Result, 
 
 	// Apply ORDER BY
 	if len(stmt.OrderBy) > 0 {
-		e.sortRows(derivedRows, stmt.OrderBy)
+		e.sortRows(derivedRows, resolveOrderByPositions(stmt.OrderBy, stmt.Columns))
 	}
 
 	// Apply LIMIT/OFFSET
@@ -808,6 +1404,39 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		return nil, err
 	}
 
+	// INSERT ... SELECT: materialise the SELECT result and bulk-insert.
+	if stmt.Select != nil {
+		sel, err := e.executeSelect(stmt.Select)
+		if err != nil {
+			return nil, err
+		}
+		rows := make([]storage.Row, 0, len(sel.Rows))
+		for _, selRow := range sel.Rows {
+			row := make(storage.Row)
+			if len(stmt.Columns) > 0 {
+				for i, col := range stmt.Columns {
+					if i < len(selRow) {
+						row[col] = selRow[i]
+					}
+				}
+			} else {
+				for i, col := range schema.Columns {
+					if i < len(selRow) {
+						row[col.Name] = selRow[i]
+					}
+				}
+			}
+			rows = append(rows, row)
+		}
+		count, err := e.table.InsertBulk(tableName, rows)
+		if err != nil {
+			return nil, err
+		}
+		result := NewResult("INSERT")
+		result.SetRowCount(count)
+		return result, nil
+	}
+
 	count := 0
 	for _, values := range stmt.Values {
 		row := make(storage.Row)
@@ -1135,6 +1764,42 @@ func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error)
 
 	result := NewResult("DROP INDEX")
 	return result, nil
+}
+
+func (e *Executor) executeCreateView(stmt *parser.CreateViewStmt) (*Result, error) {
+	name := strings.ToLower(stmt.View.Name)
+
+	if _, exists := e.views[name]; exists {
+		if stmt.IfNotExists {
+			return NewResult("CREATE VIEW"), nil
+		}
+		return nil, fmt.Errorf("view already exists: %s", stmt.View.Name)
+	}
+
+	e.views[name] = stmt.Select
+
+	// Register in catalog so the analyzer accepts SELECT FROM this view.
+	e.catalog.CreateTable(&analyzer.TableInfo{ //nolint:errcheck
+		Name:   stmt.View.Name,
+		IsView: true,
+	})
+
+	return NewResult("CREATE VIEW"), nil
+}
+
+func (e *Executor) executeDropView(stmt *parser.DropViewStmt) (*Result, error) {
+	for _, ref := range stmt.Views {
+		name := strings.ToLower(ref.Name)
+		if _, exists := e.views[name]; !exists {
+			if stmt.IfExists {
+				continue
+			}
+			return nil, fmt.Errorf("view not found: %s", ref.Name)
+		}
+		delete(e.views, name)
+		e.catalog.DropTable(ref.Name) //nolint:errcheck
+	}
+	return NewResult("DROP VIEW"), nil
 }
 
 // executeAlterTable executes an ALTER TABLE statement.
@@ -1796,51 +2461,72 @@ func (e *Executor) evalColumnRef(ref *parser.ColumnRef, row storage.Row) (interf
 		return nil, nil
 	}
 
-	// For qualified column references (table.column), check outer row first
-	// This handles correlated subqueries where the qualifier refers to an outer table
-	if ref.Table != "" && e.outerRow != nil {
-		// Try qualified name in outer row first
-		if val, ok := e.outerRow[ref.Table+"."+ref.Column]; ok {
+	// For qualified column references (table.column):
+	//
+	// Resolution order:
+	//   1. Exact qualified key in outer row  ("t1.b" → outer)
+	//   2. Case-insensitive qualified in outer row
+	//   3. Exact qualified key in current row ("x.b"  → inner alias)
+	//   4. Case-insensitive qualified in current row
+	//   5. Unqualified in outer row — only reached when qualified lookup in current
+	//      row failed, meaning the qualifier refers to an outer table not the inner
+	//      alias (e.g. "t1.b" in a subquery "FROM t1 AS x" resolves here).
+	//   6. Unqualified in current row (last resort)
+	if ref.Table != "" {
+		if e.outerRow != nil {
+			// Step 1-2: qualified lookup in outer row
+			if val, ok := e.outerRow[ref.Table+"."+ref.Column]; ok {
+				return val, nil
+			}
+			for k, v := range e.outerRow {
+				if strings.EqualFold(k, ref.Table+"."+ref.Column) {
+					return v, nil
+				}
+			}
+		}
+
+		// Step 3-4: qualified lookup in current row
+		if val, ok := row[ref.Table+"."+ref.Column]; ok {
 			return val, nil
 		}
-		// Try case-insensitive in outer row
-		for k, v := range e.outerRow {
+		for k, v := range row {
 			if strings.EqualFold(k, ref.Table+"."+ref.Column) {
 				return v, nil
 			}
 		}
-	}
 
-	// Try qualified name in current row
-	if ref.Table != "" {
-		if val, ok := row[ref.Table+"."+ref.Column]; ok {
-			return val, nil
+		// Step 5: qualified lookup failed in current row — try outer row unqualified.
+		// This handles correlated subqueries where the qualifier names an outer table
+		// (e.g. "t1.b" when the inner FROM is "t1 AS x", so current row has "x.b"
+		// but no "t1.b").
+		if e.outerRow != nil {
+			if val, ok := e.outerRow[ref.Column]; ok {
+				return val, nil
+			}
+			for k, v := range e.outerRow {
+				if strings.EqualFold(k, ref.Column) {
+					return v, nil
+				}
+			}
 		}
 	}
 
-	// Try direct column name
+	// Step 6: unqualified fallback in current row (handles unqualified refs and
+	// single-table queries like "SELECT t1.a FROM t1" where rows have plain keys).
 	if val, ok := row[ref.Column]; ok {
 		return val, nil
 	}
-
-	// Case-insensitive search in current row
 	for k, v := range row {
 		if strings.EqualFold(k, ref.Column) {
 			return v, nil
 		}
-		if ref.Table != "" && strings.EqualFold(k, ref.Table+"."+ref.Column) {
-			return v, nil
-		}
 	}
 
-	// For unqualified references, also check the outer row context
-	if e.outerRow != nil {
-		// Try direct column name in outer row
+	// For unqualified refs with an outer row context (ref.Table == "").
+	if e.outerRow != nil && ref.Table == "" {
 		if val, ok := e.outerRow[ref.Column]; ok {
 			return val, nil
 		}
-
-		// Case-insensitive search in outer row
 		for k, v := range e.outerRow {
 			if strings.EqualFold(k, ref.Column) {
 				return v, nil
@@ -1863,35 +2549,82 @@ func (e *Executor) evalBinaryExpr(expr *parser.BinaryExpr, row storage.Row) (int
 
 	switch expr.Op {
 	case lexer.TokenPlus:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return toFloat(left) + toFloat(right), nil
 	case lexer.TokenMinus:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return toFloat(left) - toFloat(right), nil
 	case lexer.TokenStar:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return toFloat(left) * toFloat(right), nil
 	case lexer.TokenSlash:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		r := toFloat(right)
 		if r == 0 {
 			return nil, nil // Division by zero returns NULL
 		}
 		return toFloat(left) / r, nil
 	case lexer.TokenPercent:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return int64(toFloat(left)) % int64(toFloat(right)), nil
 	case lexer.TokenEq:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return compare(left, right) == 0, nil
 	case lexer.TokenNeq:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return compare(left, right) != 0, nil
 	case lexer.TokenLt:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return compare(left, right) < 0, nil
 	case lexer.TokenLte:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return compare(left, right) <= 0, nil
 	case lexer.TokenGt:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return compare(left, right) > 0, nil
 	case lexer.TokenGte:
+		if left == nil || right == nil {
+			return nil, nil
+		}
 		return compare(left, right) >= 0, nil
 	case lexer.TokenAND:
-		return toBool(left) && toBool(right), nil
+		lb, rb := toBool(left), toBool(right)
+		if !lb || !rb {
+			return false, nil
+		}
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return true, nil
 	case lexer.TokenOR:
-		return toBool(left) || toBool(right), nil
+		lb, rb := toBool(left), toBool(right)
+		if lb || rb {
+			return true, nil
+		}
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return false, nil
 	case lexer.TokenConcat:
 		return toString(left) + toString(right), nil
 	default:
@@ -1907,10 +2640,19 @@ func (e *Executor) evalUnaryExpr(expr *parser.UnaryExpr, row storage.Row) (inter
 
 	switch expr.Op {
 	case lexer.TokenMinus:
+		if val == nil {
+			return nil, nil
+		}
 		return -toFloat(val), nil
 	case lexer.TokenPlus:
+		if val == nil {
+			return nil, nil
+		}
 		return toFloat(val), nil
 	case lexer.TokenNOT:
+		if val == nil {
+			return nil, nil // NOT NULL = NULL
+		}
 		return !toBool(val), nil
 	default:
 		return val, nil
@@ -1954,6 +2696,9 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		}
 	case "ABS":
 		if len(args) > 0 {
+			if args[0] == nil {
+				return nil, nil
+			}
 			v := toFloat(args[0])
 			if v < 0 {
 				return -v, nil
@@ -2155,9 +2900,14 @@ func (e *Executor) evalCaseExpr(expr *parser.CaseExpr, row storage.Row) (interfa
 		}
 
 		var match bool
-		if operand != nil {
+		if expr.Operand != nil {
+			// Simple CASE: CASE operand WHEN val THEN ... — NULL operand matches nothing
+			if operand == nil {
+				continue
+			}
 			match = compare(operand, cond) == 0
 		} else {
+			// Searched CASE: CASE WHEN cond THEN ... — NULL condition is falsy
 			match = toBool(cond)
 		}
 
@@ -2181,34 +2931,92 @@ func (e *Executor) evalInExpr(expr *parser.InExpr, row storage.Row) (interface{}
 
 	// Handle subquery: IN (SELECT ...)
 	if expr.Subquery != nil {
-		result, err := e.executeSelect(expr.Subquery)
+		var result *Result
+		var err error
+		// Cache non-correlated subquery results for the duration of this query.
+		// Safe when outerRow is nil (no outer context that the subquery could reference).
+		if e.subqueryCache != nil && e.outerRow == nil {
+			if cached, ok := e.subqueryCache[expr.Subquery]; ok {
+				result = cached
+			} else {
+				result, err = e.executeSelect(expr.Subquery)
+				if err == nil {
+					e.subqueryCache[expr.Subquery] = result
+				}
+			}
+		} else {
+			result, err = e.executeSelect(expr.Subquery)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("IN subquery error: %w", err)
 		}
-
-		// Check each row's first column value
+		if len(result.Columns) != 1 {
+			return nil, fmt.Errorf("subquery in IN must return exactly one column")
+		}
+		// SQL three-valued logic: if left is NULL → NULL; if any match → true; if any NULL → NULL; else false.
+		if left == nil {
+			return nil, nil
+		}
+		sawNull := false
 		for _, resultRow := range result.Rows {
-			if len(resultRow) > 0 {
-				if compare(left, resultRow[0]) == 0 {
-					return !expr.Not, nil
+			if len(resultRow) == 0 {
+				continue
+			}
+			v := resultRow[0]
+			if v == nil {
+				sawNull = true
+				continue
+			}
+			if compare(left, v) == 0 {
+				if expr.Not {
+					return false, nil
 				}
+				return true, nil
 			}
 		}
-		return expr.Not, nil
+		if sawNull {
+			return nil, nil
+		}
+		if expr.Not {
+			return true, nil
+		}
+		return false, nil
 	}
 
-	// Handle value list: IN (1, 2, 3)
+	// Handle value list: IN (1, 2, 3).
+	// Empty list: always FALSE (IN) / TRUE (NOT IN), even for NULL.
+	if len(expr.Values) == 0 {
+		return expr.Not, nil
+	}
+	// SQL three-valued logic: if left is NULL → NULL; if any match → true/false;
+	// if list contains NULL and no match → NULL.
+	if left == nil {
+		return nil, nil
+	}
+	sawNull := false
 	for _, val := range expr.Values {
 		v, err := e.evalExpr(val, row)
 		if err != nil {
 			return nil, err
 		}
+		if v == nil {
+			sawNull = true
+			continue
+		}
 		if compare(left, v) == 0 {
-			return !expr.Not, nil
+			if expr.Not {
+				return false, nil
+			}
+			return true, nil
 		}
 	}
-
-	return expr.Not, nil
+	if sawNull {
+		return nil, nil
+	}
+	if expr.Not {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (e *Executor) evalBetweenExpr(expr *parser.BetweenExpr, row storage.Row) (interface{}, error) {
@@ -2225,6 +3033,9 @@ func (e *Executor) evalBetweenExpr(expr *parser.BetweenExpr, row storage.Row) (i
 		return nil, err
 	}
 
+	if val == nil || low == nil || high == nil {
+		return nil, nil
+	}
 	inRange := compare(val, low) >= 0 && compare(val, high) <= 0
 	if expr.Not {
 		return !inRange, nil
@@ -2271,6 +3082,10 @@ func (e *Executor) evalCastExpr(expr *parser.CastExpr, row storage.Row) (interfa
 	val, err := e.evalExpr(expr.Expr, row)
 	if err != nil {
 		return nil, err
+	}
+
+	if val == nil {
+		return nil, nil // CAST(NULL AS any) = NULL
 	}
 
 	typeName := strings.ToUpper(expr.Type.Name)
@@ -2539,6 +3354,24 @@ func (e *Executor) isAggregate(expr parser.Expr) bool {
 		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT":
 			return true
 		}
+		return false
+	}
+	switch ex := expr.(type) {
+	case *parser.UnaryExpr:
+		return e.isAggregate(ex.Operand)
+	case *parser.BinaryExpr:
+		return e.isAggregate(ex.Left) || e.isAggregate(ex.Right)
+	case *parser.ParenExpr:
+		return e.isAggregate(ex.Expr)
+	case *parser.CaseExpr:
+		for _, w := range ex.Whens {
+			if e.isAggregate(w.Result) {
+				return true
+			}
+		}
+		if ex.Else != nil {
+			return e.isAggregate(ex.Else)
+		}
 	}
 	return false
 }
@@ -2550,6 +3383,25 @@ func (e *Executor) buildGroupKey(groupBy []parser.Expr, row storage.Row) string 
 		parts = append(parts, fmt.Sprintf("%v", val))
 	}
 	return strings.Join(parts, "|")
+}
+
+// resolveOrderByPositions replaces positional ORDER BY expressions (e.g. ORDER BY 1)
+// with the corresponding SELECT column expressions per SQL-92 semantics.
+func resolveOrderByPositions(orderBy []parser.OrderByItem, selectCols []parser.SelectColumn) []parser.OrderByItem {
+	result := make([]parser.OrderByItem, len(orderBy))
+	for i, item := range orderBy {
+		if lit, ok := item.Expr.(*parser.LiteralExpr); ok {
+			if pos, err := strconv.Atoi(lit.Value); err == nil && pos >= 1 && pos <= len(selectCols) {
+				col := selectCols[pos-1]
+				if col.Expr != nil {
+					result[i] = parser.OrderByItem{Expr: col.Expr, Desc: item.Desc}
+					continue
+				}
+			}
+		}
+		result[i] = item
+	}
+	return result
 }
 
 func (e *Executor) sortRows(rows []storage.Row, orderBy []parser.OrderByItem) {
@@ -2572,6 +3424,7 @@ func (e *Executor) sortRows(rows []storage.Row, orderBy []parser.OrderByItem) {
 // sortResultRows sorts Result.Rows based on ORDER BY clauses.
 // It handles column aliases by matching them against the select columns.
 func (e *Executor) sortResultRows(result *Result, orderBy []parser.OrderByItem, selectColumns []parser.SelectColumn, columnNames []string) {
+	orderBy = resolveOrderByPositions(orderBy, selectColumns)
 	sort.Slice(result.Rows, func(i, j int) bool {
 		for _, item := range orderBy {
 			var vi, vj interface{}
@@ -2722,6 +3575,77 @@ func toNumeric(v interface{}) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// splitANDClauses flattens a tree of AND binary expressions into a slice of leaf conditions.
+func splitANDClauses(expr parser.Expr) []parser.Expr {
+	if bin, ok := expr.(*parser.BinaryExpr); ok && bin.Op == lexer.TokenAND {
+		left := splitANDClauses(bin.Left)
+		right := splitANDClauses(bin.Right)
+		return append(left, right...)
+	}
+	return []parser.Expr{expr}
+}
+
+// collectColumnRefs returns all unqualified column names referenced in an expression.
+func collectColumnRefs(expr parser.Expr) []string {
+	var refs []string
+	var walk func(parser.Expr)
+	walk = func(e parser.Expr) {
+		if e == nil {
+			return
+		}
+		switch n := e.(type) {
+		case *parser.ColumnRef:
+			refs = append(refs, n.Column)
+		case *parser.BinaryExpr:
+			walk(n.Left)
+			walk(n.Right)
+		case *parser.UnaryExpr:
+			walk(n.Operand)
+		case *parser.InExpr:
+			walk(n.Left)
+			for _, v := range n.Values {
+				walk(v)
+			}
+		case *parser.BetweenExpr:
+			walk(n.Left)
+			walk(n.Low)
+			walk(n.High)
+		case *parser.LikeExpr:
+			walk(n.Left)
+			walk(n.Pattern)
+		case *parser.IsNullExpr:
+			walk(n.Left)
+		case *parser.CaseExpr:
+			walk(n.Operand)
+			for _, w := range n.Whens {
+				walk(w.Condition)
+				walk(w.Result)
+			}
+			walk(n.Else)
+		case *parser.FunctionCall:
+			for _, a := range n.Args {
+				walk(a)
+			}
+		case *parser.ParenExpr:
+			walk(n.Expr)
+		}
+	}
+	walk(expr)
+	return refs
+}
+
+// combineAND combines a list of expressions with AND.
+func combineAND(clauses []parser.Expr) parser.Expr {
+	if len(clauses) == 0 {
+		return nil
+	}
+	result := clauses[0]
+	for _, c := range clauses[1:] {
+		result = &parser.BinaryExpr{Left: result, Op: lexer.TokenAND, Right: c}
+	}
+	return result
 }
 
 // matchLike matches a string against a SQL LIKE pattern.

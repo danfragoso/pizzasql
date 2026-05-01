@@ -107,10 +107,10 @@ func (m *SchemaManager) CreateTable(schema *Schema) error {
 				break
 			}
 		}
-		// Default to first column if no primary key specified
-		if schema.PrimaryKey == "" && len(schema.Columns) > 0 {
-			schema.PrimaryKey = schema.Columns[0].Name
-			schema.Columns[0].PrimaryKey = true
+		// No explicit primary key declared — use synthetic _rowid_ so user
+		// columns remain unconstrained and can hold duplicate or NULL values.
+		if schema.PrimaryKey == "" {
+			schema.PrimaryKey = "_rowid_"
 		}
 	}
 

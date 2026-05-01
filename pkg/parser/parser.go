@@ -141,13 +141,15 @@ func (p *Parser) parseStatement() (Statement, error) {
 	}
 }
 
-// parseSelect parses a SELECT statement.
-func (p *Parser) parseSelect() (*SelectStmt, error) {
+// parseSingleSelectTerm parses one SELECT body (SELECT … FROM … WHERE … GROUP BY … HAVING …)
+// but stops before any set operator, ORDER BY, LIMIT, or OFFSET.
+// Callers that want the full chain (including set ops) use parseSelect instead.
+func (p *Parser) parseSingleSelectTerm() (*SelectStmt, error) {
 	stmt := &SelectStmt{}
 
 	p.nextToken() // consume SELECT
 
-	// Check for DISTINCT
+	// Check for DISTINCT / ALL
 	if p.curTokenIs(lexer.TokenDISTINCT) {
 		stmt.Distinct = true
 		p.nextToken()
@@ -155,14 +157,12 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		p.nextToken()
 	}
 
-	// Parse select columns
 	cols, err := p.parseSelectColumns()
 	if err != nil {
 		return nil, err
 	}
 	stmt.Columns = cols
 
-	// Parse FROM clause
 	if p.curTokenIs(lexer.TokenFROM) {
 		p.nextToken()
 		tables, err := p.parseTableRefs()
@@ -172,7 +172,6 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.From = tables
 	}
 
-	// Parse WHERE clause
 	if p.curTokenIs(lexer.TokenWHERE) {
 		p.nextToken()
 		where, err := p.parseExpr()
@@ -182,7 +181,6 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.Where = where
 	}
 
-	// Parse GROUP BY clause
 	if p.curTokenIs(lexer.TokenGROUP) {
 		if err := p.expectPeek(lexer.TokenBY); err != nil {
 			return nil, err
@@ -195,7 +193,6 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 		stmt.GroupBy = groupBy
 	}
 
-	// Parse HAVING clause
 	if p.curTokenIs(lexer.TokenHAVING) {
 		p.nextToken()
 		having, err := p.parseExpr()
@@ -203,6 +200,26 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 			return nil, err
 		}
 		stmt.Having = having
+	}
+
+	return stmt, nil
+}
+
+// parseSelect parses a SELECT statement, including any trailing set operations
+// (UNION / INTERSECT / EXCEPT) and an optional ORDER BY / LIMIT / OFFSET.
+func (p *Parser) parseSelect() (*SelectStmt, error) {
+	stmt, err := p.parseSingleSelectTerm()
+	if err != nil {
+		return nil, err
+	}
+
+	// Handle set operations: UNION [ALL], INTERSECT, EXCEPT
+	if p.curTokenIs(lexer.TokenUNION) || p.curTokenIs(lexer.TokenINTERSECT) || p.curTokenIs(lexer.TokenEXCEPT) {
+		compound, err := p.parseCompoundChain(stmt)
+		if err != nil {
+			return nil, err
+		}
+		return &SelectStmt{Compound: compound}, nil
 	}
 
 	// Parse ORDER BY clause
@@ -239,6 +256,142 @@ func (p *Parser) parseSelect() (*SelectStmt, error) {
 	}
 
 	return stmt, nil
+}
+
+// setOpPrec returns the precedence of a set operator token.
+// INTERSECT binds more tightly than UNION/EXCEPT per SQL standard.
+func setOpPrec(t lexer.TokenType) int {
+	if t == lexer.TokenINTERSECT {
+		return 2
+	}
+	return 1
+}
+
+// parseCompoundChain collects all set-op legs and builds a left-associative tree
+// respecting INTERSECT > UNION/EXCEPT precedence.
+//
+// The algorithm is the standard precedence-climbing / Pratt approach:
+//
+//	parseMin(minPrec):
+//	  left = first already-parsed SELECT (passed in as `first`)
+//	  while curOp.prec >= minPrec:
+//	      op = curOp; consume op
+//	      right = parseSingleSelect()
+//	      while nextOp.prec > op.prec:   // right-bind tighter ops
+//	          right = parseMin(op.prec+1) using right as seed
+//	      left = Compound(left, op, right)
+//	  return left
+func (p *Parser) parseCompoundChain(first *SelectStmt) (*CompoundSelect, error) {
+	type leg struct {
+		op    SetOpType
+		query *SelectStmt
+	}
+
+	// Consume a set-op token and return its SetOpType + precedence.
+	consumeOp := func() (SetOpType, int, error) {
+		switch p.curToken.Type {
+		case lexer.TokenUNION:
+			p.nextToken()
+			if p.curTokenIs(lexer.TokenALL) {
+				p.nextToken()
+				return SetOpUnionAll, 1, nil
+			}
+			return SetOpUnion, 1, nil
+		case lexer.TokenINTERSECT:
+			p.nextToken()
+			return SetOpIntersect, 2, nil
+		case lexer.TokenEXCEPT:
+			p.nextToken()
+			return SetOpExcept, 1, nil
+		}
+		return 0, 0, p.curError("expected UNION, INTERSECT, or EXCEPT")
+	}
+
+	isSetOp := func() bool {
+		return p.curTokenIs(lexer.TokenUNION) ||
+			p.curTokenIs(lexer.TokenINTERSECT) ||
+			p.curTokenIs(lexer.TokenEXCEPT)
+	}
+
+	// parseSingleSelect parses the next SELECT term (no set-ops claimed).
+	parseSingleSelect := func() (*SelectStmt, error) {
+		if !p.curTokenIs(lexer.TokenSELECT) {
+			return nil, p.curError("expected SELECT after set operator")
+		}
+		return p.parseSingleSelectTerm()
+	}
+
+	// Precedence-climbing: build left-to-right tree, INTERSECT binds tighter.
+	var climb func(left *SelectStmt, minPrec int) (*CompoundSelect, error)
+	climb = func(left *SelectStmt, minPrec int) (*CompoundSelect, error) {
+		for isSetOp() && setOpPrec(p.curToken.Type) >= minPrec {
+			op, prec, err := consumeOp()
+			if err != nil {
+				return nil, err
+			}
+			right, err := parseSingleSelect()
+			if err != nil {
+				return nil, err
+			}
+			// If the right node itself resolved to a compound (via recursive parseSelect),
+			// unwrap and re-climb properly.
+			if right.Compound != nil {
+				// right was a sub-chain; treat it as already climbed.
+			} else {
+				// Absorb any higher-precedence ops on the right.
+				for isSetOp() && setOpPrec(p.curToken.Type) > prec {
+					sub, err := climb(right, prec+1)
+					if err != nil {
+						return nil, err
+					}
+					right = &SelectStmt{Compound: sub}
+					break
+				}
+			}
+			node := &CompoundSelect{Left: left, Op: op, Right: right}
+			left = &SelectStmt{Compound: node}
+		}
+		if left.Compound != nil {
+			return left.Compound, nil
+		}
+		return nil, p.curError("internal: no compound built")
+	}
+
+	compound, err := climb(first, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse trailing ORDER BY / LIMIT / OFFSET that apply to the whole compound.
+	if p.curTokenIs(lexer.TokenORDER) {
+		if err := p.expectPeek(lexer.TokenBY); err != nil {
+			return nil, err
+		}
+		p.nextToken()
+		orderBy, err := p.parseOrderBy()
+		if err != nil {
+			return nil, err
+		}
+		compound.OrderBy = orderBy
+	}
+	if p.curTokenIs(lexer.TokenLIMIT) {
+		p.nextToken()
+		limit, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		compound.Limit = limit
+	}
+	if p.curTokenIs(lexer.TokenOFFSET) {
+		p.nextToken()
+		offset, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		compound.Offset = offset
+	}
+
+	return compound, nil
 }
 
 func (p *Parser) parseSelectColumns() ([]SelectColumn, error) {
@@ -736,6 +889,8 @@ func (p *Parser) parseCreate() (Statement, error) {
 			return nil, p.curError("expected INDEX after UNIQUE")
 		}
 		return p.parseCreateIndex(true)
+	case lexer.TokenVIEW:
+		return p.parseCreateView()
 	default:
 		return nil, p.curError("expected TABLE or INDEX after CREATE")
 	}
@@ -1161,6 +1316,8 @@ func (p *Parser) parseDrop() (Statement, error) {
 		return p.parseDropTable()
 	case lexer.TokenINDEX:
 		return p.parseDropIndex()
+	case lexer.TokenVIEW:
+		return p.parseDropView()
 	default:
 		return nil, p.curError("expected TABLE or INDEX after DROP")
 	}
@@ -1219,6 +1376,76 @@ func (p *Parser) parseDropIndex() (*DropIndexStmt, error) {
 	}
 	stmt.Name = p.curToken.Literal
 	p.nextToken()
+
+	return stmt, nil
+}
+
+func (p *Parser) parseCreateView() (*CreateViewStmt, error) {
+	stmt := &CreateViewStmt{}
+
+	p.nextToken() // consume VIEW
+
+	if p.curTokenIs(lexer.TokenIF) {
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenNOT) {
+			return nil, p.curError("expected NOT")
+		}
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenEXISTS) {
+			return nil, p.curError("expected EXISTS")
+		}
+		stmt.IfNotExists = true
+		p.nextToken()
+	}
+
+	// Parse view name directly — do NOT use parseTableRef here because it
+	// greedily interprets the AS keyword as an alias, consuming "AS SELECT".
+	if !p.curTokenIs(lexer.TokenIdent) {
+		return nil, p.curError("expected view name")
+	}
+	stmt.View = &TableRef{Name: p.curToken.Literal}
+	p.nextToken()
+
+	if !p.curTokenIs(lexer.TokenAS) {
+		return nil, p.curError("expected AS after view name")
+	}
+	p.nextToken() // consume AS
+
+	sel, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Select = sel
+
+	return stmt, nil
+}
+
+func (p *Parser) parseDropView() (*DropViewStmt, error) {
+	stmt := &DropViewStmt{}
+
+	p.nextToken() // consume VIEW
+
+	if p.curTokenIs(lexer.TokenIF) {
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenEXISTS) {
+			return nil, p.curError("expected EXISTS")
+		}
+		stmt.IfExists = true
+		p.nextToken()
+	}
+
+	for {
+		view, err := p.parseTableRef()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Views = append(stmt.Views, view)
+
+		if !p.curTokenIs(lexer.TokenComma) {
+			break
+		}
+		p.nextToken()
+	}
 
 	return stmt, nil
 }
@@ -1690,8 +1917,8 @@ func (p *Parser) parseInExpr(left Expr, not bool) (Expr, error) {
 			return nil, err
 		}
 		expr.Subquery = sel
-	} else {
-		// Value list
+	} else if !p.curTokenIs(lexer.TokenRParen) {
+		// Value list (empty list is allowed — always false)
 		values, err := p.parseExprList()
 		if err != nil {
 			return nil, err

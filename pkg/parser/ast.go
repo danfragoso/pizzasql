@@ -19,6 +19,29 @@ type Expr interface {
 	exprNode()
 }
 
+// SetOpType represents a set operation type.
+type SetOpType int
+
+const (
+	SetOpUnion SetOpType = iota
+	SetOpUnionAll
+	SetOpIntersect
+	SetOpExcept
+)
+
+// CompoundSelect chains two SELECT statements with a set operation.
+type CompoundSelect struct {
+	Left    *SelectStmt
+	Op      SetOpType
+	Right   *SelectStmt // may itself have Compound set for chained ops
+	OrderBy []OrderByItem
+	Limit   Expr
+	Offset  Expr
+}
+
+func (c *CompoundSelect) node()     {}
+func (c *CompoundSelect) stmtNode() {}
+
 // SelectStmt represents a SELECT statement.
 type SelectStmt struct {
 	Distinct bool
@@ -30,6 +53,8 @@ type SelectStmt struct {
 	OrderBy  []OrderByItem
 	Limit    Expr
 	Offset   Expr
+	// Compound chains a set operation onto this SELECT (UNION/INTERSECT/EXCEPT).
+	Compound *CompoundSelect
 }
 
 func (s *SelectStmt) node()     {}
@@ -216,6 +241,25 @@ type DropIndexStmt struct {
 
 func (s *DropIndexStmt) node()     {}
 func (s *DropIndexStmt) stmtNode() {}
+
+// CreateViewStmt represents a CREATE VIEW statement.
+type CreateViewStmt struct {
+	IfNotExists bool
+	View        *TableRef
+	Select      *SelectStmt
+}
+
+func (s *CreateViewStmt) node()     {}
+func (s *CreateViewStmt) stmtNode() {}
+
+// DropViewStmt represents a DROP VIEW statement.
+type DropViewStmt struct {
+	IfExists bool
+	Views    []*TableRef
+}
+
+func (s *DropViewStmt) node()     {}
+func (s *DropViewStmt) stmtNode() {}
 
 // AlterTableStmt represents an ALTER TABLE statement.
 type AlterTableStmt struct {

@@ -258,10 +258,15 @@ type TableInfo struct {
 	Name    string
 	Columns []ColumnInfo
 	Alias   string // For query-local aliases
+	IsView  bool   // Views accept any column reference
 }
 
 // GetColumn returns a column by name.
+// For views (IsView=true), returns a wildcard ColumnInfo so column analysis passes.
 func (t *TableInfo) GetColumn(name string) (*ColumnInfo, bool) {
+	if t.IsView {
+		return &ColumnInfo{Name: name, TableName: t.Name, Type: TypeAny}, true
+	}
 	upper := strings.ToUpper(name)
 	for i := range t.Columns {
 		if strings.ToUpper(t.Columns[i].Name) == upper {
