@@ -229,10 +229,16 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 
 	// If WHERE is constant false, check if we have aggregates first
 	if constantWhereResult != nil && !*constantWhereResult {
-		// If query has aggregates, we still need to evaluate them on empty row set
+		// If query has GROUP BY, return empty result (no groups match)
+		// If query has aggregates but no GROUP BY, evaluate them on empty row set
 		if e.hasAggregates(stmt.Columns) {
-			// Pass empty row set to aggregate evaluation
-			return e.executeAggregateSelect(stmt, []storage.Row{}, schema)
+			if len(stmt.GroupBy) > 0 {
+				// GROUP BY with no matching rows: return empty result (no groups)
+				// Fall through to the non-aggregate case below
+			} else {
+				// Aggregate without GROUP BY: return single row with aggregate results on empty set
+				return e.executeAggregateSelect(stmt, []storage.Row{}, schema)
+			}
 		}
 		// Non-aggregate query with WHERE false: return empty result
 		result := NewResult("SELECT")
@@ -4464,6 +4470,7 @@ func splitANDClauses(expr parser.Expr) []parser.Expr {
 // collectColumnRefs returns all unqualified column names referenced in an expression.
 func collectColumnRefs(expr parser.Expr) []string {
 	var refs []string
+	var hasSubquery bool
 	var walk func(parser.Expr)
 	walk = func(e parser.Expr) {
 		if e == nil {
@@ -4479,6 +4486,10 @@ func collectColumnRefs(expr parser.Expr) []string {
 			walk(n.Operand)
 		case *parser.InExpr:
 			walk(n.Left)
+			// Check for subquery
+			if n.Subquery != nil {
+				hasSubquery = true
+			}
 			for _, v := range n.Values {
 				walk(v)
 			}
@@ -4504,9 +4515,23 @@ func collectColumnRefs(expr parser.Expr) []string {
 			}
 		case *parser.ParenExpr:
 			walk(n.Expr)
+		case *parser.CastExpr:
+			walk(n.Expr)
+		case *parser.SubqueryExpr:
+			// Subqueries may reference outer columns
+			hasSubquery = true
+		case *parser.ExistsExpr:
+			// EXISTS subqueries may reference outer columns
+			hasSubquery = true
+		case *parser.LiteralExpr:
+			// Literals have no column refs
 		}
 	}
 	walk(expr)
+	// If we have subqueries, add a sentinel value to indicate non-constant
+	if hasSubquery {
+		refs = append(refs, "__subquery__")
+	}
 	return refs
 }
 

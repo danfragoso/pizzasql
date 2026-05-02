@@ -1491,3 +1491,103 @@ func TestDistinct(t *testing.T) {
 		}
 	})
 }
+
+// TestGroupByWithConstantFalseWhere tests the distinction between:
+// 1. Aggregate without GROUP BY + WHERE false -> returns [NULL] (one row with aggregate result on empty set)
+// 2. Aggregate with GROUP BY + WHERE false -> returns [] (no groups match, so no rows)
+func TestGroupByWithConstantFalseWhere(t *testing.T) {
+	pool, err := storage.NewKVPool("localhost:8085", 5, 5*time.Second)
+	if err != nil {
+		t.Skip("PizzaKV not available, skipping test")
+	}
+	defer pool.Close()
+
+	schema := storage.NewSchemaManager(pool, "test_groupby_db")
+	table := storage.NewTableManager(pool, schema, "test_groupby_db")
+	exec := New(schema, table)
+
+	// Setup test tables
+	execSQL(exec, "DROP TABLE IF EXISTS tab0")
+	execSQL(exec, "DROP TABLE IF EXISTS tab1")
+
+	_, err = execSQL(exec, "CREATE TABLE tab0 (col0 INTEGER, col1 INTEGER, col2 INTEGER)")
+	if err != nil {
+		t.Fatalf("failed to create tab0: %v", err)
+	}
+
+	_, err = execSQL(exec, "CREATE TABLE tab1 (col0 INTEGER, col1 INTEGER, col2 INTEGER)")
+	if err != nil {
+		t.Fatalf("failed to create tab1: %v", err)
+	}
+
+	// Insert some test data
+	execSQL(exec, "INSERT INTO tab0 VALUES (1, 10, 100)")
+	execSQL(exec, "INSERT INTO tab0 VALUES (2, 20, 200)")
+	execSQL(exec, "INSERT INTO tab0 VALUES (3, 30, 300)")
+
+	execSQL(exec, "INSERT INTO tab1 VALUES (1, 10, 100)")
+	execSQL(exec, "INSERT INTO tab1 VALUES (2, 20, 200)")
+	execSQL(exec, "INSERT INTO tab1 VALUES (3, 30, 300)")
+
+	// Test 1: Aggregate with GROUP BY and constant FALSE WHERE -> should return empty result []
+	t.Run("aggregate_with_groupby_where_false", func(t *testing.T) {
+		result, err := execSQL(exec, "SELECT AVG(col1) FROM tab1 WHERE NULL IS NOT NULL GROUP BY col1")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if result.RowCount != 0 {
+			t.Errorf("expected 0 rows (no groups), got %d rows with values: %v", result.RowCount, result.Rows)
+		}
+	})
+
+	// Test 2: Aggregate without GROUP BY and constant FALSE WHERE -> should return [NULL]
+	t.Run("aggregate_without_groupby_where_false", func(t *testing.T) {
+		result, err := execSQL(exec, "SELECT AVG(col1) FROM tab1 WHERE NULL IS NOT NULL")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if result.RowCount != 1 {
+			t.Errorf("expected 1 row, got %d", result.RowCount)
+		}
+		if result.RowCount == 1 && result.Rows[0][0] != nil {
+			t.Errorf("expected NULL for aggregate on empty set, got %v", result.Rows[0][0])
+		}
+	})
+
+	// Test 3: More complex case from test failures
+	t.Run("complex_groupby_where_false", func(t *testing.T) {
+		result, err := execSQL(exec, "SELECT ALL AVG(+ col1) FROM tab1 WHERE NULL IS NULL AND NOT NULL IS NULL GROUP BY col1")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if result.RowCount != 0 {
+			t.Errorf("expected 0 rows (no groups), got %d rows with values: %v", result.RowCount, result.Rows)
+		}
+	})
+
+	// Test 4: DISTINCT aggregate with GROUP BY and constant FALSE WHERE
+	t.Run("distinct_aggregate_with_groupby_where_false", func(t *testing.T) {
+		result, err := execSQL(exec, "SELECT DISTINCT AVG(DISTINCT - col2) FROM tab0 WHERE NOT NULL IS NULL GROUP BY col2")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if result.RowCount != 0 {
+			t.Errorf("expected 0 rows (no groups), got %d rows with values: %v", result.RowCount, result.Rows)
+		}
+	})
+
+	// Test 5: Verify normal GROUP BY still works (WHERE true)
+	t.Run("normal_groupby_sanity_check", func(t *testing.T) {
+		result, err := execSQL(exec, "SELECT AVG(col1) FROM tab1 WHERE NULL IS NULL GROUP BY col1")
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if result.RowCount != 3 {
+			t.Errorf("expected 3 groups, got %d", result.RowCount)
+		}
+	})
+
+	// Cleanup
+	execSQL(exec, "DROP TABLE IF EXISTS tab0")
+	execSQL(exec, "DROP TABLE IF EXISTS tab1")
+}
