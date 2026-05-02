@@ -499,7 +499,7 @@ func formatValue(v interface{}, colType byte) string {
 			if i, err := strconv.ParseInt(n, 10, 64); err == nil {
 				return strconv.FormatInt(i, 10)
 			}
-			return n
+			return "0"
 		default:
 			return fmt.Sprintf("%v", v)
 		}
@@ -515,7 +515,7 @@ func formatValue(v interface{}, colType byte) string {
 			if f, err := strconv.ParseFloat(n, 64); err == nil {
 				return strconv.FormatFloat(f, 'g', 3, 64)
 			}
-			return n
+			return "0"
 		default:
 			return fmt.Sprintf("%v", v)
 		}
