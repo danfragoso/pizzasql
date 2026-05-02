@@ -48,9 +48,9 @@ type lineInfo struct {
 type record struct {
 	isStatement bool
 	isQuery     bool
-	expectOK    bool     // statement: true → expect success
-	typeStr     string   // query: column type chars (I/R/T)
-	sortMode    string   // nosort | rowsort | valuesort
+	expectOK    bool   // statement: true → expect success
+	typeStr     string // query: column type chars (I/R/T)
+	sortMode    string // nosort | rowsort | valuesort
 	label       string
 	sql         string
 	expected    []string // flattened expected values, one per line
@@ -85,19 +85,19 @@ type runner struct {
 	passed     int
 	failed     int
 	skipped    int
-	total      int    // total files to run
-	filesDone  int    // files completed
+	total      int // total files to run
+	filesDone  int // files completed
 	logW       *bufio.Writer
 	logPath    string
 }
 
 func main() {
-	urlFlag     := flag.String("url", "http://localhost:8080", "PizzaSQL server URL")
-	dirFlag     := flag.String("dir", "testdata/sqllogictest", "Directory containing .test files")
-	fileFlag    := flag.String("file", "", "Single .test file to run (overrides -dir)")
+	urlFlag := flag.String("url", "http://localhost:8080", "PizzaSQL server URL")
+	dirFlag := flag.String("dir", "testdata/sqllogictest", "Directory containing .test files")
+	fileFlag := flag.String("file", "", "Single .test file to run (overrides -dir)")
 	verboseFlag := flag.Bool("v", false, "Print each passing record")
-	stopFlag    := flag.Bool("stop", false, "Stop on first failure")
-	logFlag     := flag.String("log", "sqllogictest-failures.log", "File to write failures to ('' to disable)")
+	stopFlag := flag.Bool("stop", false, "Stop on first failure")
+	logFlag := flag.String("log", "sqllogictest-failures.log", "File to write failures to ('' to disable)")
 	flag.Parse()
 
 	r := &runner{
@@ -254,7 +254,7 @@ func (r *runner) printProgress(currentFile string, start time.Time) {
 	var etaStr string
 	if r.filesDone > 0 {
 		rate := float64(r.filesDone) / elapsed.Seconds()
-		eta := time.Duration(float64(r.total-r.filesDone)/rate * float64(time.Second)).Round(time.Second)
+		eta := time.Duration(float64(r.total-r.filesDone) / rate * float64(time.Second)).Round(time.Second)
 		etaStr = "eta " + eta.String()
 	} else {
 		etaStr = "eta --"

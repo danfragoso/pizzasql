@@ -25,20 +25,21 @@ import (
 )
 
 var (
-	kvAddr     = flag.String("kvaddr", "localhost:8085", "PizzaKV server address (ignored if -kv is set)")
-	kvLaunch   = flag.Bool("kv", false, "Launch PizzaKV automatically")
-	kvFlags    = flag.String("kvflags", "", "Flags to pass to PizzaKV (e.g., \"-iwal -port=9090\")")
-	kvInfoFile = flag.String("kvinfo", ".pizzakv.json", "Path to PizzaKV info file")
-	database   = flag.String("db", "pizzasql", "Database name")
-	poolSize   = flag.Int("pool", 5, "Connection pool size")
-	timeout    = flag.Duration("timeout", 30*time.Second, "Query timeout")
-	httpEnable = flag.Bool("http", false, "Enable HTTP server")
-	httpHost   = flag.String("http-host", "localhost", "HTTP server host")
-	httpPort   = flag.Int("http-port", 8080, "HTTP server port")
-	httpCORS   = flag.Bool("http-cors", true, "Enable CORS")
-	httpAuth   = flag.Bool("http-auth", false, "Enable authentication")
-	httpQuiet  = flag.Bool("quiet", false, "Disable request logging")
-	apiKeys    = flag.String("api-keys", "", "Comma-separated API keys")
+	kvAddr          = flag.String("kvaddr", "localhost:8085", "PizzaKV server address (ignored if -kv is set)")
+	kvLaunch        = flag.Bool("kv", false, "Launch PizzaKV automatically")
+	kvFlags         = flag.String("kvflags", "", "Flags to pass to PizzaKV (e.g., \"-iwal -port=9090\")")
+	kvInfoFile      = flag.String("kvinfo", ".pizzakv.json", "Path to PizzaKV info file")
+	database        = flag.String("db", "pizzasql", "Database name")
+	poolSize        = flag.Int("pool", 5, "Connection pool size")
+	timeout         = flag.Duration("timeout", 30*time.Second, "Query timeout")
+	httpEnable      = flag.Bool("http", false, "Enable HTTP server")
+	httpHost        = flag.String("http-host", "localhost", "HTTP server host")
+	httpPort        = flag.Int("http-port", 8080, "HTTP server port")
+	httpCORS        = flag.Bool("http-cors", true, "Enable CORS")
+	httpAuth        = flag.Bool("http-auth", false, "Enable authentication")
+	httpCompression = flag.Bool("http-compression", true, "Enable HTTP response compression")
+	httpQuiet       = flag.Bool("quiet", false, "Disable request logging")
+	apiKeys         = flag.String("api-keys", "", "Comma-separated API keys")
 
 	// Export/Import flags
 	exportFile   = flag.String("o", "", "Output file for export")
@@ -51,6 +52,7 @@ var (
 )
 
 var kvManager *kvmanager.Manager
+var startPprofServerHook func() *http.Server
 
 func main() {
 	flag.Parse()
@@ -749,6 +751,7 @@ func runHTTPServer() {
 	config.Port = *httpPort
 	config.EnableCORS = *httpCORS
 	config.EnableAuth = *httpAuth
+	config.EnableCompression = *httpCompression
 	config.EnableLogging = !*httpQuiet
 
 	if *apiKeys != "" {
@@ -757,6 +760,10 @@ func runHTTPServer() {
 
 	// Create and start server with multi-database support
 	server := httpserver.NewWithDatabaseManager(config, dbManager)
+	var pprofServer *http.Server
+	if startPprofServerHook != nil {
+		pprofServer = startPprofServerHook()
+	}
 
 	// Handle graceful shutdown
 	stop := make(chan os.Signal, 1)
@@ -771,6 +778,9 @@ func runHTTPServer() {
 	}()
 
 	fmt.Printf("PizzaSQL HTTP server started on http://%s:%d\n", *httpHost, *httpPort)
+	if pprofServer != nil {
+		fmt.Printf("pprof debug server started on http://%s/debug/pprof/\n", pprofServer.Addr)
+	}
 	fmt.Printf("Default database: %s\n", *database)
 	fmt.Printf("PizzaKV: %s\n", *kvAddr)
 	fmt.Println()
@@ -806,6 +816,11 @@ func runHTTPServer() {
 
 	if err := server.Shutdown(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Error during shutdown: %v\n", err)
+	}
+	if pprofServer != nil {
+		if err := pprofServer.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error during pprof shutdown: %v\n", err)
+		}
 	}
 
 	fmt.Println("Server stopped")
