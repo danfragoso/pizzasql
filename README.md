@@ -174,8 +174,21 @@ go build -o pizzasql
 
 ## Quick Start
 
-### 1. Start PizzaKV (in a separate terminal)
+### 1. Start PizzaKV
 
+**Option A: Let PizzaSQL launch it automatically (recommended):**
+```bash
+# PizzaSQL will start PizzaKV on a random port
+./pizzasql -kv
+
+# With PizzaKV flags (e.g., disable WAL)
+./pizzasql -kv -kvflags="-iwal"
+
+# HTTP server mode with auto-launched PizzaKV
+./pizzasql -http -kv
+```
+
+**Option B: Start PizzaKV manually (in a separate terminal):**
 ```bash
 pizzakv
 ```
@@ -1473,9 +1486,12 @@ CREATE TABLE users (
 
 ```bash
 # Database options
--kv string      PizzaKV server address (default "localhost:8085")
--db string      Database name (default "pizzasql")
--e string       Execute single statement and exit
+-kvaddr string    PizzaKV server address (default "localhost:8085") (ignored if -kv is set)
+-kv               Launch PizzaKV automatically
+-kvflags string   Flags to pass to PizzaKV (e.g., "-iwal -port=9090")
+-kvinfo string    Path to PizzaKV info file (default ".pizzakv.json")
+-db string        Database name (default "pizzasql")
+-e string         Execute single statement and exit
 
 # HTTP server options
 -http           Start HTTP server

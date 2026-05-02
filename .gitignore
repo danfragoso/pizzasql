@@ -3,3 +3,4 @@
 testdata
 .db
 *.log
+.pizzakv.json

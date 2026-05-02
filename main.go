@@ -12,19 +12,23 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/danfragoso/pizzasql-next/pkg/executor"
-	"github.com/danfragoso/pizzasql-next/pkg/httpserver"
-	"github.com/danfragoso/pizzasql-next/pkg/lexer"
-	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/csvexport"
 	"github.com/danfragoso/pizzasql-next/pkg/csvimport"
+	"github.com/danfragoso/pizzasql-next/pkg/executor"
+	"github.com/danfragoso/pizzasql-next/pkg/httpserver"
+	"github.com/danfragoso/pizzasql-next/pkg/kvmanager"
+	"github.com/danfragoso/pizzasql-next/pkg/lexer"
+	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
 var (
-	kvAddr     = flag.String("kv", "localhost:8085", "PizzaKV server address")
+	kvAddr     = flag.String("kvaddr", "localhost:8085", "PizzaKV server address (ignored if -kv is set)")
+	kvLaunch   = flag.Bool("kv", false, "Launch PizzaKV automatically")
+	kvFlags    = flag.String("kvflags", "", "Flags to pass to PizzaKV (e.g., \"-iwal -port=9090\")")
+	kvInfoFile = flag.String("kvinfo", ".pizzakv.json", "Path to PizzaKV info file")
 	database   = flag.String("db", "pizzasql", "Database name")
 	poolSize   = flag.Int("pool", 5, "Connection pool size")
 	timeout    = flag.Duration("timeout", 30*time.Second, "Query timeout")
@@ -46,8 +50,29 @@ var (
 	createTable  = flag.Bool("create-table", false, "Create table if not exists (CSV import)")
 )
 
+var kvManager *kvmanager.Manager
+
 func main() {
 	flag.Parse()
+
+	// If -kv flag is set, launch PizzaKV
+	if *kvLaunch {
+		if err := launchPizzaKV(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to launch PizzaKV: %v\n", err)
+			os.Exit(1)
+		}
+		defer stopPizzaKV()
+
+		// Set up signal handling for graceful shutdown
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			<-sigChan
+			fmt.Println("\nShutting down...")
+			stopPizzaKV()
+			os.Exit(0)
+		}()
+	}
 
 	// Check if HTTP server mode is enabled
 	if *httpEnable {
@@ -784,4 +809,62 @@ func runHTTPServer() {
 	}
 
 	fmt.Println("Server stopped")
+}
+
+// launchPizzaKV starts a PizzaKV instance and updates kvAddr
+func launchPizzaKV() error {
+	kvManager = kvmanager.NewManager()
+	kvManager.SetInfoFile(*kvInfoFile)
+
+	// Clean up any stale process info
+	if err := kvmanager.CleanupStaleProcess(*kvInfoFile); err != nil {
+		// Check if it's an "already running" error
+		if strings.Contains(err.Error(), "already running") {
+			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+			fmt.Fprintf(os.Stderr, "\nOptions:\n")
+			fmt.Fprintf(os.Stderr, "  1. Use the existing instance: remove -kv flag and use -kvaddr=localhost:<port>\n")
+			fmt.Fprintf(os.Stderr, "  2. Stop it: kill %d\n", getPIDFromFile(*kvInfoFile))
+			fmt.Fprintf(os.Stderr, "  3. Delete the info file: rm %s\n\n", *kvInfoFile)
+			return err
+		}
+		return fmt.Errorf("failed to cleanup stale process: %w", err)
+	}
+
+	fmt.Println("Starting PizzaKV...")
+	info, err := kvManager.Start(*kvFlags)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\nPizzaKV started on %s (PID: %d)\n", info.Addr, info.PID)
+	fmt.Printf("Info written to: %s\n", *kvInfoFile)
+	fmt.Println("PizzaKV is ready!\n")
+
+	// Update kvAddr to use the launched instance
+	*kvAddr = info.Addr
+
+	return nil
+}
+
+// stopPizzaKV stops the managed PizzaKV instance
+func stopPizzaKV() {
+	if kvManager != nil {
+		fmt.Println("Stopping PizzaKV...")
+		if err := kvManager.Stop(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error stopping PizzaKV: %v\n", err)
+		} else {
+			fmt.Println("PizzaKV stopped")
+		}
+	}
+}
+
+// getPIDFromFile reads the PID from the info file
+func getPIDFromFile(path string) int {
+	mgr := kvmanager.NewManager()
+	mgr.SetInfoFile(path)
+	info, err := mgr.LoadInfo()
+	if err != nil {
+		return 0
+	}
+	return info.PID
 }

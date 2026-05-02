@@ -297,6 +297,7 @@ func (a *Analyzer) resolveFromClause(tables []parser.TableRef) error {
 				Name:    table.Name,
 				Columns: table.Columns,
 				Alias:   ref.Alias,
+				IsView:  table.IsView,
 			}
 			a.scope.DefineTable(tableInfo)
 		}
@@ -329,6 +330,7 @@ func (a *Analyzer) resolveJoin(join *parser.JoinClause) error {
 		Name:    table.Name,
 		Columns: table.Columns,
 		Alias:   join.Table.Alias,
+		IsView:  table.IsView,
 	}
 	a.scope.DefineTable(tableInfo)
 

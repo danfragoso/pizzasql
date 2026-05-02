@@ -212,6 +212,7 @@ func (r *runner) runFile(path string, start time.Time) error {
 		r.execQuery("DROP VIEW IF EXISTS " + v) //nolint:errcheck
 	}
 
+	labelCache := make(map[string][]string) // label → first result
 	failsBefore := r.failed
 	for _, rec := range records {
 		if r.stopOnFail && r.failed > 0 {
@@ -221,7 +222,7 @@ func (r *runner) runFile(path string, start time.Time) error {
 			r.skipped++
 			continue
 		}
-		r.runRecord(rec)
+		r.runRecord(rec, labelCache)
 		r.printProgress(path, start)
 	}
 
@@ -360,7 +361,7 @@ func collectCreatedTables(records []*record) []string {
 	return tables
 }
 
-func (r *runner) runRecord(rec *record) {
+func (r *runner) runRecord(rec *record, labelCache map[string][]string) {
 	resp, err := r.execQuery(rec.sql)
 	if err != nil {
 		r.fail(rec, "http error: %v", err)
@@ -390,28 +391,45 @@ func (r *runner) runRecord(rec *record) {
 		return
 	}
 
+	got := r.formatResults(resp, rec.typeStr)
+	ncols := len(rec.typeStr)
+	if ncols == 0 {
+		ncols = 1
+	}
+
+	// Apply sort before any comparison.
+	switch rec.sortMode {
+	case "rowsort":
+		got = sortRows(got, ncols)
+	case "valuesort":
+		g := append([]string(nil), got...)
+		sort.Strings(g)
+		got = g
+	}
+
+	// Label caching: if this query has a label, compare against first occurrence.
+	if rec.label != "" {
+		if cached, seen := labelCache[rec.label]; seen {
+			if !equalSlices(got, cached) {
+				r.fail(rec, "label %q result mismatch\n    want: %v\n    got:  %v", rec.label, cached, got)
+			} else {
+				r.pass(rec)
+			}
+			return
+		}
+		// First occurrence: store and fall through to normal expected-value check.
+		labelCache[rec.label] = got
+	}
+
 	// hash format: "N values hashing to <md5>"
 	if len(rec.expected) == 1 {
 		parts := strings.Fields(rec.expected[0])
 		if len(parts) == 5 && parts[1] == "values" && parts[2] == "hashing" && parts[3] == "to" {
 			wantCount, _ := strconv.Atoi(parts[0])
 			wantHash := parts[4]
-			got := r.formatResults(resp, rec.typeStr)
 			if len(got) != wantCount {
 				r.fail(rec, "hash record: want %d values got %d", wantCount, len(got))
 				return
-			}
-			ncols := len(rec.typeStr)
-			if ncols == 0 {
-				ncols = 1
-			}
-			switch rec.sortMode {
-			case "rowsort":
-				got = sortRows(got, ncols)
-			case "valuesort":
-				g := append([]string(nil), got...)
-				sort.Strings(g)
-				got = g
 			}
 			h := md5.Sum([]byte(strings.Join(got, "\n") + "\n"))
 			gotHash := fmt.Sprintf("%x", h)
@@ -424,23 +442,14 @@ func (r *runner) runRecord(rec *record) {
 		}
 	}
 
-	got := r.formatResults(resp, rec.typeStr)
 	exp := rec.expected
-
 	switch rec.sortMode {
 	case "rowsort":
-		ncols := len(rec.typeStr)
-		if ncols == 0 {
-			ncols = 1
-		}
-		got = sortRows(got, ncols)
 		exp = sortRows(exp, ncols)
 	case "valuesort":
-		g := append([]string(nil), got...)
 		e := append([]string(nil), exp...)
-		sort.Strings(g)
 		sort.Strings(e)
-		got, exp = g, e
+		exp = e
 	}
 
 	if !equalSlices(got, exp) {

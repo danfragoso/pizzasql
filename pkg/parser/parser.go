@@ -512,7 +512,33 @@ func (p *Parser) parseTableRef() (*TableRef, error) {
 
 			return ref, nil
 		}
-		return nil, p.curError("expected SELECT after ( in FROM clause")
+		// Parenthesized table expression: (table1 JOIN table2) or (table1, table2)
+		innerRefs, err := p.parseTableRefs()
+		if err != nil {
+			return nil, err
+		}
+		if !p.curTokenIs(lexer.TokenRParen) {
+			return nil, p.curError("expected ) after table expression")
+		}
+		p.nextToken()
+		// Flatten: use first ref as base, attach remaining as joins
+		if len(innerRefs) == 0 {
+			return nil, p.curError("empty table expression")
+		}
+		base := &innerRefs[0]
+		for i := 1; i < len(innerRefs); i++ {
+			cur := base
+			for cur.Join != nil && cur.Join.Table != nil {
+				cur = cur.Join.Table
+			}
+			extra := innerRefs[i]
+			if cur.Join == nil {
+				cur.Join = &JoinClause{Type: JoinCross, Table: &extra}
+			} else {
+				cur.Join.Table = &extra
+			}
+		}
+		return base, nil
 	}
 
 	if !p.curTokenIs(lexer.TokenIdent) {
@@ -2145,9 +2171,12 @@ func (p *Parser) parseFunctionCall(name string) (Expr, error) {
 
 	p.nextToken() // consume (
 
-	// Check for DISTINCT
+	// Check for DISTINCT or ALL
 	if p.curTokenIs(lexer.TokenDISTINCT) {
 		fn.Distinct = true
+		p.nextToken()
+	} else if p.curTokenIs(lexer.TokenALL) {
+		// ALL is the default behavior, just skip it
 		p.nextToken()
 	}
 
