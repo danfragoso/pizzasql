@@ -2,7 +2,6 @@ package executor
 
 import (
 	"fmt"
-	"math"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -213,11 +212,57 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	// then apply WHERE after. Don't push WHERE down here — conditions reference multiple tables.
 	isMultiTable := len(stmt.From) > 1 && stmt.From[0].Join == nil
 
+	// Optimize constant WHERE clauses
+	var constantWhereResult *bool
+	if stmt.Where != nil && !isMultiTable {
+		// Check if WHERE clause is a constant expression (doesn't reference any columns)
+		refs := collectColumnRefs(stmt.Where)
+		if len(refs) == 0 {
+			// Evaluate the constant expression
+			val, err := e.evalExpr(stmt.Where, nil)
+			if err == nil {
+				result := toBool(val)
+				constantWhereResult = &result
+			}
+		}
+	}
+
+	// If WHERE is constant false, check if we have aggregates first
+	if constantWhereResult != nil && !*constantWhereResult {
+		// If query has aggregates, we still need to evaluate them on empty row set
+		if e.hasAggregates(stmt.Columns) {
+			// Pass empty row set to aggregate evaluation
+			return e.executeAggregateSelect(stmt, []storage.Row{}, schema)
+		}
+		// Non-aggregate query with WHERE false: return empty result
+		result := NewResult("SELECT")
+		for i, col := range stmt.Columns {
+			if col.Alias != "" {
+				result.AddColumn(col.Alias)
+			} else if ref, ok := col.Expr.(*parser.ColumnRef); ok {
+				result.AddColumn(ref.Column)
+			} else if col.Star {
+				for _, c := range schema.Columns {
+					result.AddColumn(c.Name)
+				}
+			} else {
+				result.AddColumn(fmt.Sprintf("column%d", i+1))
+			}
+		}
+		return result, nil
+	}
+
 	// Try to use index for WHERE clause (single-table only)
 	var rows []storage.Row
 	usedIndex := false
 
-	if stmt.Where != nil && !isMultiTable {
+	// If WHERE is constant true, skip it during table scan
+	effectiveWhere := stmt.Where
+	if constantWhereResult != nil && *constantWhereResult {
+		effectiveWhere = nil
+	}
+
+	if effectiveWhere != nil && !isMultiTable {
 		// Check if we can use an index
 		colName, colValue, isEquality := e.extractIndexableCondition(stmt.Where)
 		if isEquality {
@@ -229,6 +274,10 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 					rows, err = e.table.SelectByIndex(tableName, idx.Name, colValue)
 					if err == nil {
 						usedIndex = true
+						// Normalize rows from index
+						for i := range rows {
+							normalizeRowBySchema(rows[i], schema)
+						}
 					}
 					break
 				}
@@ -240,9 +289,9 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	if !usedIndex {
 		var filterErr error
 		var filter func(storage.Row) bool
-		if stmt.Where != nil && stmt.From[0].Alias == "" && !isMultiTable {
+		if effectiveWhere != nil && stmt.From[0].Alias == "" && !isMultiTable {
 			filter = func(row storage.Row) bool {
-				val, ferr := e.evalExpr(stmt.Where, row)
+				val, ferr := e.evalExpr(effectiveWhere, row)
 				if ferr != nil {
 					filterErr = ferr
 					return false
@@ -253,6 +302,9 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		rows, err = e.table.Select(tableName, filter)
 		if filterErr != nil {
 			return nil, filterErr
+		}
+		for _, row := range rows {
+			normalizeRowBySchema(row, schema)
 		}
 	}
 	if err != nil {
@@ -273,11 +325,11 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	}
 
 	// Apply WHERE for single-table with alias (after alias mapping so alias.col refs work)
-	if stmt.Where != nil && stmt.From[0].Alias != "" && !isMultiTable {
+	if effectiveWhere != nil && stmt.From[0].Alias != "" && !isMultiTable {
 		var filterErr error
 		var filtered []storage.Row
 		for _, row := range rows {
-			val, ferr := e.evalExpr(stmt.Where, row)
+			val, ferr := e.evalExpr(effectiveWhere, row)
 			if ferr != nil {
 				filterErr = ferr
 				break
@@ -297,6 +349,52 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		rows, err = e.executeJoins(stmt.From[0], rows)
 		if err != nil {
 			return nil, err
+		}
+		// Cross-join with any remaining comma-separated FROM entries (mixed JOIN+comma syntax)
+		for _, tref := range stmt.From[1:] {
+			rightRows, rerr := e.table.Select(tref.Name, nil)
+			if rerr != nil {
+				return nil, rerr
+			}
+			rightAlias := tref.Alias
+			if rightAlias == "" {
+				rightAlias = tref.Name
+			}
+			for i := range rightRows {
+				rightRows[i] = e.addTableAlias(rightRows[i], rightAlias)
+			}
+			var joined []storage.Row
+			for _, l := range rows {
+				for _, r := range rightRows {
+					m := make(storage.Row, len(l)+len(r))
+					for k, v := range l {
+						m[k] = v
+					}
+					for k, v := range r {
+						m[k] = v
+					}
+					joined = append(joined, m)
+				}
+			}
+			rows = joined
+			// Handle JOINs within this tref too
+			if tref.Join != nil {
+				rows, err = e.executeJoins(tref, rows)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		// Apply WHERE after all cross-joins
+		if stmt.Where != nil && len(stmt.From) > 1 {
+			var filtered []storage.Row
+			for _, row := range rows {
+				val, _ := e.evalExpr(stmt.Where, row)
+				if toBool(val) {
+					filtered = append(filtered, row)
+				}
+			}
+			rows = filtered
 		}
 	}
 
@@ -393,18 +491,35 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			}
 		}
 
+		// Build alias-to-index map for applyWhenSeen.
+		aliasToIdx := make(map[string]int, len(allTableInfos))
+		for i, ti := range allTableInfos {
+			aliasToIdx[strings.ToLower(ti.alias)] = i
+		}
+
 		// Helper: find cross-conditions applicable when seenSet is fully present.
+		// A condition is applicable only when ALL tables it references are in seenSet.
+		// For table-qualified refs (e.g. cor0.col2), we check the qualifying alias is seen.
 		applyWhenSeen := func(seenSet map[int]bool, pending []parser.Expr) (applicable, still []parser.Expr) {
 			for _, clause := range pending {
-				refs := collectColumnRefs(clause)
+				tableRefs := collectTableColumnRefs(clause)
 				ok := true
-				for _, ref := range refs {
-					cl := strings.ToLower(ref)
+				for _, tr := range tableRefs {
+					col := strings.ToLower(tr.col)
+					tbl := strings.ToLower(tr.tbl)
 					found := false
-					for j, tti := range allTableInfos {
-						if tti.colsSet[cl] && seenSet[j] {
+					if tbl != "" {
+						// Explicit table qualifier — check that qualifying alias is seen.
+						if idx, exists := aliasToIdx[tbl]; exists && seenSet[idx] {
 							found = true
-							break
+						}
+					} else {
+						// Unqualified — any seen table with this column satisfies it.
+						for j, tti := range allTableInfos {
+							if tti.colsSet[col] && seenSet[j] {
+								found = true
+								break
+							}
 						}
 					}
 					if !found {
@@ -536,7 +651,9 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			if rerr != nil {
 				return nil, rerr
 			}
+			seedSchema, _ := e.schema.GetSchema(stmt.From[seed].Name)
 			for j := range seedRows {
+				normalizeRowBySchema(seedRows[j], seedSchema)
 				seedRows[j] = e.addTableAlias(seedRows[j], allTableInfos[seed].alias)
 			}
 			vSeen := map[int]bool{seed: true}
@@ -576,7 +693,9 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if rerr != nil {
 					return nil, rerr
 				}
+				nextSchema, _ := e.schema.GetSchema(stmt.From[nextC].Name)
 				for j := range nextRows {
+					normalizeRowBySchema(nextRows[j], nextSchema)
 					nextRows[j] = e.addTableAlias(nextRows[j], allTableInfos[nextC].alias)
 				}
 				vSeen[nextC] = true
@@ -659,7 +778,9 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if err != nil {
 					return nil, err
 				}
+				firstSchema, _ := e.schema.GetSchema(stmt.From[first].Name)
 				for i := range rows {
+					normalizeRowBySchema(rows[i], firstSchema)
 					rows[i] = e.addTableAlias(rows[i], allTableInfos[first].alias)
 				}
 			}
@@ -683,7 +804,9 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 				if rerr != nil {
 					return nil, rerr
 				}
+				rightSchema, _ := e.schema.GetSchema(stmt.From[idx].Name)
 				for j := range rightRows {
+					normalizeRowBySchema(rightRows[j], rightSchema)
 					rightRows[j] = e.addTableAlias(rightRows[j], ti.alias)
 				}
 				if len(tableFilters[idx]) > 0 {
@@ -738,13 +861,51 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			rows = filtered
 		}
 
-		// Also process any JOIN clauses within FROM entries (mixed comma+JOIN syntax).
+		// Also cross-join with any JOIN chains within FROM entries (mixed comma+JOIN syntax).
+		// We cannot use executeJoins here because the left rows already have qualified keys
+		// from the isMultiTable cross-join; re-aliasing the left side would corrupt them.
 		for _, tref := range stmt.From {
-			if tref.Join != nil {
-				rows, err = e.executeJoins(tref, rows)
-				if err != nil {
-					return nil, err
+			join := tref.Join
+			for join != nil && join.Table != nil {
+				rightRef := join.Table
+				rightRows, rerr := e.table.Select(rightRef.Name, nil)
+				if rerr != nil {
+					return nil, rerr
 				}
+				rightAlias := rightRef.Alias
+				if rightAlias == "" {
+					rightAlias = rightRef.Name
+				}
+				rightSchema, _ := e.schema.GetSchema(rightRef.Name)
+				for j := range rightRows {
+					normalizeRowBySchema(rightRows[j], rightSchema)
+					rightRows[j] = e.addTableAlias(rightRows[j], rightAlias)
+				}
+				var joined []storage.Row
+				for _, l := range rows {
+					for _, r := range rightRows {
+						m := make(storage.Row, len(l)+len(r))
+						for k, v := range l {
+							m[k] = v
+						}
+						for k, v := range r {
+							if _, exists := m[k]; !exists {
+								m[k] = v
+							} else if strings.Contains(k, ".") {
+								m[k] = v // qualified keys from right always win
+							}
+						}
+						if join.Condition != nil {
+							val, _ := e.evalExpr(join.Condition, m)
+							if !toBool(val) {
+								continue
+							}
+						}
+						joined = append(joined, m)
+					}
+				}
+				rows = joined
+				join = rightRef.Join
 			}
 		}
 	}
@@ -1188,9 +1349,24 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, s
 
 	result := NewResult("SELECT")
 
+	// Expand SELECT * if present
+	expandedColumns := make([]parser.SelectColumn, 0)
+	for _, col := range stmt.Columns {
+		if col.Star {
+			// Expand * to all columns from schema
+			for _, c := range schema.Columns {
+				expandedColumns = append(expandedColumns, parser.SelectColumn{
+					Expr: &parser.ColumnRef{Column: c.Name},
+				})
+			}
+		} else {
+			expandedColumns = append(expandedColumns, col)
+		}
+	}
+
 	// Determine columns
-	columnNames := make([]string, len(stmt.Columns))
-	for i, col := range stmt.Columns {
+	columnNames := make([]string, len(expandedColumns))
+	for i, col := range expandedColumns {
 		if col.Alias != "" {
 			columnNames[i] = col.Alias
 			result.AddColumn(col.Alias)
@@ -1213,8 +1389,8 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, s
 			}
 		}
 
-		values := make([]interface{}, len(stmt.Columns))
-		for i, col := range stmt.Columns {
+		values := make([]interface{}, len(expandedColumns))
+		for i, col := range expandedColumns {
 			if e.isAggregate(col.Expr) {
 				val, err := e.evalAggregateExpr(col.Expr, groupRows)
 				if err != nil {
@@ -1240,7 +1416,7 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, s
 
 	// Apply ORDER BY
 	if len(stmt.OrderBy) > 0 {
-		e.sortResultRows(result, stmt.OrderBy, stmt.Columns, columnNames)
+		e.sortResultRows(result, stmt.OrderBy, expandedColumns, columnNames)
 	}
 
 	// Apply LIMIT/OFFSET
@@ -1276,6 +1452,10 @@ func (e *Executor) executeJoins(tableRef parser.TableRef, leftRows []storage.Row
 	rightRows, err := e.table.Select(rightTable, nil)
 	if err != nil {
 		return nil, err
+	}
+	rightSchema, _ := e.schema.GetSchema(rightTable)
+	for _, row := range rightRows {
+		normalizeRowBySchema(row, rightSchema)
 	}
 
 	// Perform the join between left and right
@@ -1322,8 +1502,24 @@ func (e *Executor) executeJoins(tableRef parser.TableRef, leftRows []storage.Row
 				}
 			}
 			if !matched {
-				// Add left row with nulls for right
-				result = append(result, left)
+				// Add left row with nulls for right table columns
+				// Create a null row for the right table
+				nullRight := make(storage.Row)
+				if len(rightRows) > 0 {
+					// Use the first right row as a template to get column names
+					for k := range rightRows[0] {
+						nullRight[k] = nil
+					}
+				} else {
+					// If right table is empty, get schema to determine columns
+					rightSchema, err := e.schema.GetSchema(rightTable)
+					if err == nil {
+						for _, col := range rightSchema.Columns {
+							nullRight[col.Name] = nil
+						}
+					}
+				}
+				result = append(result, e.mergeRows(left, nullRight, leftAlias, rightAlias))
 			}
 		}
 
@@ -1388,8 +1584,24 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 				}
 			}
 			if !matched {
-				// Add left row with nulls for right
-				result = append(result, left)
+				// Add left row with nulls for right table columns
+				// Create a null row for the right table
+				nullRight := make(storage.Row)
+				if len(rightRows) > 0 {
+					// Use the first right row as a template to get column names
+					for k := range rightRows[0] {
+						nullRight[k] = nil
+					}
+				} else {
+					// If right table is empty, get schema to determine columns
+					rightSchema, err := e.schema.GetSchema(rightTable)
+					if err == nil {
+						for _, col := range rightSchema.Columns {
+							nullRight[col.Name] = nil
+						}
+					}
+				}
+				result = append(result, e.mergeRows(left, nullRight, tableRef.Alias, join.Table.Alias))
 			}
 		}
 
@@ -1457,6 +1669,24 @@ func collectAllTableRefs(from []parser.TableRef) []parser.TableRef {
 }
 
 // addTableAlias adds table-qualified names to a row.
+// normalizeRowBySchema converts float64 values in integer-affinity columns to int64.
+// This is needed because JSON deserialization always produces float64 for numbers.
+func normalizeRowBySchema(row storage.Row, schema *storage.Schema) {
+	if schema == nil {
+		return
+	}
+	for _, col := range schema.Columns {
+		upper := strings.ToUpper(col.Type)
+		isInt := strings.Contains(upper, "INT") || upper == "BOOLEAN" || upper == "BOOL"
+		if !isInt {
+			continue
+		}
+		if f, ok := row[col.Name].(float64); ok {
+			row[col.Name] = int64(f)
+		}
+	}
+}
+
 func (e *Executor) addTableAlias(row storage.Row, alias string) storage.Row {
 	result := make(storage.Row)
 	for k, v := range row {
@@ -2777,6 +3007,177 @@ func (e *Executor) evalBinaryExpr(expr *parser.BinaryExpr, row storage.Row) (int
 	}
 }
 
+// applyBinaryOp applies a binary operator to two already-evaluated values.
+func (e *Executor) applyBinaryOp(op lexer.TokenType, left, right interface{}) (interface{}, error) {
+	dummy := &parser.BinaryExpr{Op: op}
+	_ = dummy
+	switch op {
+	case lexer.TokenPlus:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		if isIntVal(left) && isIntVal(right) {
+			return toInt64(left) + toInt64(right), nil
+		}
+		return toFloat(left) + toFloat(right), nil
+	case lexer.TokenMinus:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		if isIntVal(left) && isIntVal(right) {
+			return toInt64(left) - toInt64(right), nil
+		}
+		return toFloat(left) - toFloat(right), nil
+	case lexer.TokenStar:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		if isIntVal(left) && isIntVal(right) {
+			return toInt64(left) * toInt64(right), nil
+		}
+		return toFloat(left) * toFloat(right), nil
+	case lexer.TokenSlash:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		if isIntVal(left) && isIntVal(right) {
+			ri := toInt64(right)
+			if ri == 0 {
+				return nil, nil
+			}
+			return toInt64(left) / ri, nil
+		}
+		r := toFloat(right)
+		if r == 0 {
+			return nil, nil
+		}
+		return toFloat(left) / r, nil
+	case lexer.TokenPercent:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		if isIntVal(left) && isIntVal(right) {
+			ri := toInt64(right)
+			if ri == 0 {
+				return nil, nil
+			}
+			return toInt64(left) % ri, nil
+		}
+		return int64(toFloat(left)) % int64(toFloat(right)), nil
+	case lexer.TokenEq:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return compare(left, right) == 0, nil
+	case lexer.TokenNeq:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return compare(left, right) != 0, nil
+	case lexer.TokenLt:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return compare(left, right) < 0, nil
+	case lexer.TokenLte:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return compare(left, right) <= 0, nil
+	case lexer.TokenGt:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return compare(left, right) > 0, nil
+	case lexer.TokenGte:
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return compare(left, right) >= 0, nil
+	case lexer.TokenAND:
+		if left != nil && !toBool(left) {
+			return false, nil
+		}
+		if right != nil && !toBool(right) {
+			return false, nil
+		}
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return true, nil
+	case lexer.TokenOR:
+		if left != nil && toBool(left) {
+			return true, nil
+		}
+		if right != nil && toBool(right) {
+			return true, nil
+		}
+		if left == nil || right == nil {
+			return nil, nil
+		}
+		return false, nil
+	case lexer.TokenConcat:
+		return toString(left) + toString(right), nil
+	default:
+		return nil, fmt.Errorf("unsupported operator: %v", op)
+	}
+}
+
+// evalBuiltinFunction applies a named scalar function to pre-evaluated args.
+func (e *Executor) evalBuiltinFunction(name string, args []interface{}) (interface{}, error) {
+	switch name {
+	case "NULLIF":
+		if len(args) >= 2 && compare(args[0], args[1]) == 0 {
+			return nil, nil
+		}
+		if len(args) > 0 {
+			return args[0], nil
+		}
+	case "IFNULL", "NVL":
+		if len(args) >= 2 {
+			if args[0] == nil {
+				return args[1], nil
+			}
+			return args[0], nil
+		}
+	case "COALESCE":
+		for _, a := range args {
+			if a != nil {
+				return a, nil
+			}
+		}
+		return nil, nil
+	case "ABS":
+		if len(args) > 0 && args[0] != nil {
+			if isIntVal(args[0]) {
+				v := toInt64(args[0])
+				if v < 0 {
+					return -v, nil
+				}
+				return v, nil
+			}
+			v := toFloat(args[0])
+			if v < 0 {
+				return -v, nil
+			}
+			return v, nil
+		}
+	case "LENGTH":
+		if len(args) > 0 && args[0] != nil {
+			return int64(len(fmt.Sprintf("%v", args[0]))), nil
+		}
+	}
+	// Fall back: store pre-evaluated values in row and build column refs.
+	row := make(storage.Row, len(args))
+	fn := &parser.FunctionCall{Name: name}
+	for i, a := range args {
+		key := fmt.Sprintf("__arg%d__", i)
+		row[key] = a
+		fn.Args = append(fn.Args, &parser.ColumnRef{Column: key})
+	}
+	return e.evalFunctionCall(fn, row)
+}
+
 func (e *Executor) evalUnaryExpr(expr *parser.UnaryExpr, row storage.Row) (interface{}, error) {
 	val, err := e.evalExpr(expr.Operand, row)
 	if err != nil {
@@ -3218,15 +3619,20 @@ func (e *Executor) evalBetweenExpr(expr *parser.BetweenExpr, row storage.Row) (i
 		if val == nil {
 			return nil, nil
 		}
+		// x BETWEEN a AND b  =  (x >= a) AND (x <= b)
+		// NULL AND FALSE = FALSE; NULL AND TRUE = NULL
 		if low == nil {
-			return nil, nil // val >= NULL = NULL
+			// x >= NULL = NULL; check upper bound for early FALSE
+			if high != nil && compare(val, high) > 0 {
+				return false, nil // NULL AND FALSE = FALSE
+			}
+			return nil, nil // NULL AND TRUE/NULL = NULL
 		}
 		if compare(val, low) < 0 {
-			return false, nil // val < low → definitely not in range
+			return false, nil // val < low → FALSE AND anything = FALSE
 		}
-		// val >= low: now check upper bound
 		if high == nil {
-			return nil, nil // val <= NULL = NULL
+			return nil, nil // TRUE AND NULL = NULL
 		}
 		return compare(val, high) <= 0, nil
 	}
@@ -3385,7 +3791,9 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 		return count, nil
 
 	case "SUM":
-		var sum float64
+		var sumInt int64
+		var sumFloat float64
+		allInt := true
 		hasValues := false
 		var seen map[interface{}]struct{}
 		if fn.Distinct {
@@ -3402,7 +3810,12 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 						}
 						seen[key] = struct{}{}
 					}
-					sum += toFloat(val)
+					if isIntVal(val) {
+						sumInt += toInt64(val)
+					} else {
+						allInt = false
+						sumFloat += toFloat(val)
+					}
 					hasValues = true
 				}
 			}
@@ -3410,7 +3823,10 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 		if !hasValues {
 			return nil, nil
 		}
-		return sum, nil
+		if allInt {
+			return sumInt, nil
+		}
+		return sumFloat + float64(sumInt), nil
 
 	case "AVG":
 		var sum float64
@@ -3454,11 +3870,9 @@ func (e *Executor) evalAggregateExpr(expr parser.Expr, rows []storage.Row) (inte
 		return max, nil
 
 	default:
-		// Try scalar function
-		if len(rows) > 0 {
-			return e.evalFunctionCall(fn, rows[0])
-		}
-		return nil, nil
+		// Non-aggregate scalar function: evaluate args through aggregate context
+		// (so COUNT/MIN/etc. inside NULLIF/COALESCE work correctly).
+		return e.evalExprWithAggregates(expr, rows)
 	}
 }
 
@@ -3474,70 +3888,33 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 		if err != nil {
 			return nil, err
 		}
-
-		// Apply the binary operator
-		switch ex.Op {
-		case lexer.TokenPlus:
-			if left == nil || right == nil {
-				return nil, nil
-			}
-			return toFloat(left) + toFloat(right), nil
-		case lexer.TokenMinus:
-			if left == nil || right == nil {
-				return nil, nil
-			}
-			return toFloat(left) - toFloat(right), nil
-		case lexer.TokenStar:
-			if left == nil || right == nil {
-				return nil, nil
-			}
-			return toFloat(left) * toFloat(right), nil
-		case lexer.TokenSlash:
-			if left == nil || right == nil {
-				return nil, nil
-			}
-			r := toFloat(right)
-			if r == 0 {
-				return nil, nil
-			}
-			return toFloat(left) / r, nil
-		case lexer.TokenPercent:
-			if left == nil || right == nil {
-				return nil, nil
-			}
-			return int64(toFloat(left)) % int64(toFloat(right)), nil
-		case lexer.TokenEq:
-			return compare(left, right) == 0, nil
-		case lexer.TokenNeq:
-			return compare(left, right) != 0, nil
-		case lexer.TokenLt:
-			return compare(left, right) < 0, nil
-		case lexer.TokenLte:
-			return compare(left, right) <= 0, nil
-		case lexer.TokenGt:
-			return compare(left, right) > 0, nil
-		case lexer.TokenGte:
-			return compare(left, right) >= 0, nil
-		case lexer.TokenAND:
-			return toBool(left) && toBool(right), nil
-		case lexer.TokenOR:
-			return toBool(left) || toBool(right), nil
-		case lexer.TokenConcat:
-			return toString(left) + toString(right), nil
-		default:
-			return nil, fmt.Errorf("unsupported operator: %v", ex.Op)
-		}
+		// Use the same logic as evalBinaryExpr to preserve integer semantics.
+		combined := &parser.BinaryExpr{Op: ex.Op}
+		return e.applyBinaryOp(combined.Op, left, right)
 	case *parser.FunctionCall:
-		return e.evalAggregateExpr(expr, rows)
+		name := strings.ToUpper(ex.Name)
+		switch name {
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT":
+			return e.evalAggregateExpr(expr, rows)
+		default:
+			// Non-aggregate: evaluate each arg with aggregate context, then apply scalar.
+			args := make([]interface{}, len(ex.Args))
+			for i, arg := range ex.Args {
+				v, err := e.evalExprWithAggregates(arg, rows)
+				if err != nil {
+					return nil, err
+				}
+				args[i] = v
+			}
+			return e.evalBuiltinFunction(name, args)
+		}
 	case *parser.ParenExpr:
-		// Evaluate the inner expression
 		return e.evalExprWithAggregates(ex.Expr, rows)
 	case *parser.UnaryExpr:
 		operand, err := e.evalExprWithAggregates(ex.Operand, rows)
 		if err != nil {
 			return nil, err
 		}
-		// Apply the unary operator
 		switch ex.Op {
 		case lexer.TokenPlus:
 			return operand, nil
@@ -3545,33 +3922,221 @@ func (e *Executor) evalExprWithAggregates(expr parser.Expr, rows []storage.Row) 
 			if operand == nil {
 				return nil, nil
 			}
+			if isIntVal(operand) {
+				return -toInt64(operand), nil
+			}
 			return -toFloat(operand), nil
 		case lexer.TokenNOT:
+			if operand == nil {
+				return nil, nil // NOT NULL = NULL
+			}
 			return !toBool(operand), nil
 		default:
 			return nil, fmt.Errorf("unsupported unary operator: %v", ex.Op)
 		}
 	case *parser.CastExpr:
-		// Evaluate the inner expression first
+		// Evaluate inner expression with aggregate context, then apply cast.
 		val, err := e.evalExprWithAggregates(ex.Expr, rows)
 		if err != nil {
 			return nil, err
 		}
-		// For aggregate context, we just return the value
-		// The actual casting will be handled elsewhere if needed
-		return val, nil
-	default:
-		// Non-aggregate expression
-		// For literals and constants, we can evaluate without a row
-		if _, ok := expr.(*parser.LiteralExpr); ok {
-			// Create a dummy empty row for literal evaluation
-			return e.evalExpr(expr, storage.Row{})
+		if val == nil {
+			return nil, nil
 		}
-		// For other expressions, use first row if available
+		switch strings.ToUpper(ex.Type.Name) {
+		case "INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT", "SIGNED":
+			if isIntVal(val) {
+				return toInt64(val), nil
+			}
+			return int64(toFloat(val)), nil
+		case "REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL":
+			return toFloat(val), nil
+		case "TEXT", "VARCHAR", "CHAR", "STRING":
+			return fmt.Sprintf("%v", val), nil
+		}
+		return val, nil
+	case *parser.CaseExpr:
+		var operand interface{}
+		if ex.Operand != nil {
+			operand, _ = e.evalExprWithAggregates(ex.Operand, rows)
+		}
+		for _, when := range ex.Whens {
+			condVal, _ := e.evalExprWithAggregates(when.Condition, rows)
+			var matched bool
+			if ex.Operand != nil {
+				matched = operand != nil && condVal != nil && compare(operand, condVal) == 0
+			} else {
+				matched = toBool(condVal)
+			}
+			if matched {
+				return e.evalExprWithAggregates(when.Result, rows)
+			}
+		}
+		if ex.Else != nil {
+			return e.evalExprWithAggregates(ex.Else, rows)
+		}
+		return nil, nil
+	case *parser.IsNullExpr:
+		val, err := e.evalExprWithAggregates(ex.Left, rows)
+		if err != nil {
+			return nil, err
+		}
+		isNull := val == nil
+		if ex.Not {
+			return !isNull, nil
+		}
+		return isNull, nil
+	case *parser.BetweenExpr:
+		val, err := e.evalExprWithAggregates(ex.Left, rows)
+		if err != nil {
+			return nil, err
+		}
+		low, err := e.evalExprWithAggregates(ex.Low, rows)
+		if err != nil {
+			return nil, err
+		}
+		high, err := e.evalExprWithAggregates(ex.High, rows)
+		if err != nil {
+			return nil, err
+		}
+
+		if ex.Not {
+			// NOT BETWEEN: val < low OR val > high
+			var lessThan, greaterThan interface{}
+
+			if val == nil || low == nil {
+				lessThan = nil
+			} else {
+				lessThan = compare(val, low) < 0
+			}
+
+			if val == nil || high == nil {
+				greaterThan = nil
+			} else {
+				greaterThan = compare(val, high) > 0
+			}
+
+			// Three-valued OR
+			if toBool(lessThan) || toBool(greaterThan) {
+				return true, nil
+			}
+			if lessThan == nil || greaterThan == nil {
+				return nil, nil
+			}
+			return false, nil
+		} else {
+			// BETWEEN: val >= low AND val <= high
+			if val == nil {
+				return nil, nil
+			}
+			if low == nil {
+				if high != nil && compare(val, high) > 0 {
+					return false, nil
+				}
+				return nil, nil
+			}
+			if compare(val, low) < 0 {
+				return false, nil
+			}
+			if high == nil {
+				return nil, nil
+			}
+			return compare(val, high) <= 0, nil
+		}
+	case *parser.InExpr:
+		left, err := e.evalExprWithAggregates(ex.Left, rows)
+		if err != nil {
+			return nil, err
+		}
+
+		// Handle subquery
+		if ex.Subquery != nil {
+			var result *Result
+			var err error
+			if e.subqueryCache != nil && e.outerRow == nil {
+				if cached, ok := e.subqueryCache[ex.Subquery]; ok {
+					result = cached
+				} else {
+					result, err = e.executeSelect(ex.Subquery)
+					if err == nil {
+						e.subqueryCache[ex.Subquery] = result
+					}
+				}
+			} else {
+				result, err = e.executeSelect(ex.Subquery)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("IN subquery error: %w", err)
+			}
+			if len(result.Columns) != 1 {
+				return nil, fmt.Errorf("subquery in IN must return exactly one column")
+			}
+			if left == nil {
+				return nil, nil
+			}
+			sawNull := false
+			for _, resultRow := range result.Rows {
+				if len(resultRow) == 0 {
+					continue
+				}
+				v := resultRow[0]
+				if v == nil {
+					sawNull = true
+					continue
+				}
+				if compare(left, v) == 0 {
+					if ex.Not {
+						return false, nil
+					}
+					return true, nil
+				}
+			}
+			if sawNull {
+				return nil, nil
+			}
+			if ex.Not {
+				return true, nil
+			}
+			return false, nil
+		}
+
+		// Handle value list
+		if len(ex.Values) == 0 {
+			return ex.Not, nil
+		}
+		if left == nil {
+			return nil, nil
+		}
+		sawNull := false
+		for _, val := range ex.Values {
+			v, err := e.evalExprWithAggregates(val, rows)
+			if err != nil {
+				return nil, err
+			}
+			if v == nil {
+				sawNull = true
+				continue
+			}
+			if compare(left, v) == 0 {
+				if ex.Not {
+					return false, nil
+				}
+				return true, nil
+			}
+		}
+		if sawNull {
+			return nil, nil
+		}
+		if ex.Not {
+			return true, nil
+		}
+		return false, nil
+	default:
+		// Literals and non-aggregate expressions.
 		if len(rows) > 0 {
 			return e.evalExpr(expr, rows[0])
 		}
-		return nil, nil
+		return e.evalExpr(expr, storage.Row{})
 	}
 }
 
@@ -3611,6 +4176,12 @@ func (e *Executor) isAggregate(expr parser.Expr) bool {
 		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT":
 			return true
 		}
+		// Non-aggregate function: check if any arg contains an aggregate.
+		for _, arg := range fn.Args {
+			if e.isAggregate(arg) {
+				return true
+			}
+		}
 		return false
 	}
 	switch ex := expr.(type) {
@@ -3621,8 +4192,11 @@ func (e *Executor) isAggregate(expr parser.Expr) bool {
 	case *parser.ParenExpr:
 		return e.isAggregate(ex.Expr)
 	case *parser.CaseExpr:
+		if ex.Operand != nil && e.isAggregate(ex.Operand) {
+			return true
+		}
 		for _, w := range ex.Whens {
-			if e.isAggregate(w.Result) {
+			if e.isAggregate(w.Condition) || e.isAggregate(w.Result) {
 				return true
 			}
 		}
@@ -3631,6 +4205,20 @@ func (e *Executor) isAggregate(expr parser.Expr) bool {
 		}
 	case *parser.CastExpr:
 		return e.isAggregate(ex.Expr)
+	case *parser.IsNullExpr:
+		return e.isAggregate(ex.Left)
+	case *parser.BetweenExpr:
+		return e.isAggregate(ex.Left) || e.isAggregate(ex.Low) || e.isAggregate(ex.High)
+	case *parser.InExpr:
+		if e.isAggregate(ex.Left) {
+			return true
+		}
+		for _, val := range ex.Values {
+			if e.isAggregate(val) {
+				return true
+			}
+		}
+		return false
 	}
 	return false
 }
@@ -3742,17 +4330,10 @@ func (e *Executor) evalIntExpr(expr parser.Expr) int {
 // Type conversion helpers
 
 func isIntVal(v interface{}) bool {
-	switch val := v.(type) {
-	case int64:
-		return true
-	case int:
-		return true
-	case float64:
-		return val == math.Trunc(val) && !math.IsInf(val, 0) && !math.IsNaN(val)
-	case bool:
+	switch v.(type) {
+	case int64, int, bool:
 		return true
 	default:
-		_ = val
 		return false
 	}
 }
@@ -3923,6 +4504,55 @@ func collectColumnRefs(expr parser.Expr) []string {
 			}
 		case *parser.ParenExpr:
 			walk(n.Expr)
+		}
+	}
+	walk(expr)
+	return refs
+}
+
+type tableColRef struct{ tbl, col string }
+
+// collectTableColumnRefs returns all column references with their table qualifier (may be "").
+func collectTableColumnRefs(expr parser.Expr) []tableColRef {
+	var refs []tableColRef
+	var walk func(parser.Expr)
+	walk = func(e parser.Expr) {
+		if e == nil {
+			return
+		}
+		switch n := e.(type) {
+		case *parser.ColumnRef:
+			refs = append(refs, tableColRef{tbl: n.Table, col: n.Column})
+		case *parser.BinaryExpr:
+			walk(n.Left)
+			walk(n.Right)
+		case *parser.UnaryExpr:
+			walk(n.Operand)
+		case *parser.InExpr:
+			walk(n.Left)
+			for _, v := range n.Values {
+				walk(v)
+			}
+		case *parser.BetweenExpr:
+			walk(n.Left)
+			walk(n.Low)
+			walk(n.High)
+		case *parser.LikeExpr:
+			walk(n.Left)
+			walk(n.Pattern)
+		case *parser.IsNullExpr:
+			walk(n.Left)
+		case *parser.CaseExpr:
+			walk(n.Operand)
+			for _, w := range n.Whens {
+				walk(w.Condition)
+				walk(w.Result)
+			}
+			walk(n.Else)
+		case *parser.FunctionCall:
+			for _, a := range n.Args {
+				walk(a)
+			}
 		}
 	}
 	walk(expr)

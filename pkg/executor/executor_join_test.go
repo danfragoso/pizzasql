@@ -80,3 +80,54 @@ func TestJoinConditionWithQualifiedNames(t *testing.T) {
 		t.Log("✓ JOIN condition can correctly compare o.id with om.org_id")
 	}
 }
+
+func TestLeftJoinWithNullConditions(t *testing.T) {
+	e := &Executor{}
+
+	// Create test rows
+	leftRows := []storage.Row{
+		{"col1": int64(1), "col2": "a"},
+		{"col1": int64(2), "col2": "b"},
+	}
+
+	// Test merging left row with null right row
+	left := leftRows[0]
+	nullRight := storage.Row{
+		"col3": nil,
+		"col4": nil,
+	}
+
+	merged := e.mergeRows(left, nullRight, "cor0", "cor1")
+
+	// Verify left columns are preserved
+	if merged["cor0.col1"] != int64(1) {
+		t.Errorf("Expected cor0.col1 = 1, got %v", merged["cor0.col1"])
+	}
+	if merged["cor0.col2"] != "a" {
+		t.Errorf("Expected cor0.col2 = 'a', got %v", merged["cor0.col2"])
+	}
+
+	// Verify right columns are NULL
+	if merged["cor1.col3"] != nil {
+		t.Errorf("Expected cor1.col3 = nil, got %v", merged["cor1.col3"])
+	}
+	if merged["cor1.col4"] != nil {
+		t.Errorf("Expected cor1.col4 = nil, got %v", merged["cor1.col4"])
+	}
+
+	// Verify unqualified columns exist
+	if merged["col1"] != int64(1) {
+		t.Errorf("Expected col1 = 1, got %v", merged["col1"])
+	}
+	if merged["col2"] != "a" {
+		t.Errorf("Expected col2 = 'a', got %v", merged["col2"])
+	}
+	if merged["col3"] != nil {
+		t.Errorf("Expected col3 = nil, got %v", merged["col3"])
+	}
+	if merged["col4"] != nil {
+		t.Errorf("Expected col4 = nil, got %v", merged["col4"])
+	}
+
+	t.Log("✓ LEFT JOIN with NULL conditions creates proper null rows for unmatched right table")
+}

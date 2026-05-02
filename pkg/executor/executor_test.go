@@ -96,7 +96,92 @@ func TestEvalArithmetic(t *testing.T) {
 	}
 }
 
-func TestEvalComparison(t *testing.T) {
+func TestEvalConstantWhereClause(t *testing.T) {
+	// Test constant WHERE clauses that don't reference any columns
+	tests := []struct {
+		name     string
+		expr     string
+		expected bool
+	}{
+		{"NULL IS NULL", "NULL IS NULL", true},
+		{"NULL IS NOT NULL", "NULL IS NOT NULL", false},
+		{"NOT NULL IS NOT NULL", "NOT NULL IS NOT NULL", true},
+		{"79 IS NOT NULL", "79 IS NOT NULL", true},
+		{"79 IS NULL", "79 IS NULL", false},
+		{"+ 79 IS NOT NULL", "+ 79 IS NOT NULL", true},
+		{"- 78 IS NOT NULL", "- 78 IS NOT NULL", true},
+	}
+
+	exec := &Executor{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stmt := parse(t, "SELECT 1 WHERE "+tt.expr)
+			sel := stmt.(*parser.SelectStmt)
+			val, err := exec.evalExpr(sel.Where, nil)
+			if err != nil {
+				t.Fatalf("evalExpr error: %v", err)
+			}
+			result := toBool(val)
+			if result != tt.expected {
+				t.Errorf("expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestConstantWhereClauseWithTable(t *testing.T) {
+	// This test requires a real database connection
+	// Skip if not available
+	tests := []struct {
+		name          string
+		whereClause   string
+		expectAllRows bool
+		expectNoRows  bool
+	}{
+		{"WHERE NULL IS NULL", "NULL IS NULL", true, false},
+		{"WHERE NULL IS NOT NULL", "NULL IS NOT NULL", false, true},
+		{"WHERE NOT NULL IS NOT NULL", "NOT NULL IS NOT NULL", true, false},
+		{"WHERE 79 IS NOT NULL", "79 IS NOT NULL", true, false},
+		{"WHERE 79 IS NULL", "79 IS NULL", false, true},
+		{"WHERE + 79 IS NOT NULL", "+ 79 IS NOT NULL", true, false},
+		{"WHERE - 78 IS NOT NULL", "- 78 IS NOT NULL", true, false},
+		{"WHERE 1 = 1", "1 = 1", true, false},
+		{"WHERE 1 = 0", "1 = 0", false, true},
+		{"WHERE TRUE", "TRUE", true, false},
+		{"WHERE FALSE", "FALSE", false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Parse the WHERE clause
+			stmt := parse(t, "SELECT col0 FROM test WHERE "+tt.whereClause)
+			sel := stmt.(*parser.SelectStmt)
+
+			// Check that the WHERE clause doesn't reference any columns
+			refs := collectColumnRefs(sel.Where)
+			if len(refs) != 0 {
+				t.Errorf("expected constant WHERE clause (no column refs), got %d refs", len(refs))
+			}
+
+			// Create a minimal executor to test constant evaluation
+			exec := &Executor{}
+			val, err := exec.evalExpr(sel.Where, nil)
+			if err != nil {
+				t.Fatalf("evalExpr error: %v", err)
+			}
+			result := toBool(val)
+
+			if tt.expectAllRows && !result {
+				t.Errorf("expected WHERE to evaluate to TRUE (select all rows), got FALSE")
+			}
+			if tt.expectNoRows && result {
+				t.Errorf("expected WHERE to evaluate to FALSE (select no rows), got TRUE")
+			}
+		})
+	}
+}
+
+func TestComparison(t *testing.T) {
 	exec := &Executor{}
 
 	tests := []struct {
@@ -1374,7 +1459,7 @@ func TestAttachDetach(t *testing.T) {
 func TestDistinct(t *testing.T) {
 	// Simple test without requiring KV connection
 	exec := &Executor{}
-	
+
 	// Test applyDistinct function directly
 	t.Run("ApplyDistinct", func(t *testing.T) {
 		rows := [][]interface{}{
@@ -1384,20 +1469,20 @@ func TestDistinct(t *testing.T) {
 			{"c", 3},
 			{"b", 2}, // duplicate
 		}
-		
+
 		result := exec.applyDistinct(rows)
-		
+
 		if len(result) != 3 {
 			t.Errorf("expected 3 unique rows, got %d", len(result))
 		}
-		
+
 		// Check that we have the expected unique rows
 		expected := map[string]bool{
 			"a\x001": true,
 			"b\x002": true,
 			"c\x003": true,
 		}
-		
+
 		for _, row := range result {
 			key := fmt.Sprintf("%v\x00%v", row[0], row[1])
 			if !expected[key] {

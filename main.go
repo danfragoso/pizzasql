@@ -838,7 +838,7 @@ func launchPizzaKV() error {
 
 	fmt.Printf("\nPizzaKV started on %s (PID: %d)\n", info.Addr, info.PID)
 	fmt.Printf("Info written to: %s\n", *kvInfoFile)
-	fmt.Println("PizzaKV is ready!\n")
+	fmt.Println("PizzaKV is ready!")
 
 	// Update kvAddr to use the launched instance
 	*kvAddr = info.Addr

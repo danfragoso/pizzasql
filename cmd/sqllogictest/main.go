@@ -485,7 +485,7 @@ func formatValue(v interface{}, colType byte) string {
 	case 'I':
 		switch n := v.(type) {
 		case float64:
-			return strconv.FormatInt(int64(math.Round(n)), 10)
+			return strconv.FormatInt(int64(n), 10)
 		case int64:
 			return strconv.FormatInt(n, 10)
 		case int:
