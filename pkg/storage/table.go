@@ -1,10 +1,11 @@
 package storage
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/goccy/go-json"
 )
 
 // Row represents a database row.

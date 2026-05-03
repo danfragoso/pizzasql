@@ -1,9 +1,10 @@
 package httpserver
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
+
+	"github.com/goccy/go-json"
 )
 
 // ColumnInfo represents column metadata.
@@ -82,11 +83,11 @@ func writeError(w http.ResponseWriter, status int, code, message string, details
 			Details: details,
 		},
 	}
-	
+
 	// Log server errors (5xx status codes)
 	if status >= 500 {
 		log.Printf("ERROR [%d] %s: %s", status, code, message)
 	}
-	
+
 	writeJSON(w, status, resp, false)
 }

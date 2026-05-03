@@ -1,11 +1,12 @@
 package storage
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/goccy/go-json"
 
 	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 )

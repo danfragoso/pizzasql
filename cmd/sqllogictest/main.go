@@ -12,7 +12,6 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/md5"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
@@ -23,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/goccy/go-json"
 )
 
 const engineName = "pizzasql"

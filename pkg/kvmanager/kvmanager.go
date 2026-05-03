@@ -1,7 +1,6 @@
 package kvmanager
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/goccy/go-json"
 )
 
 // KVInfo contains information about the running PizzaKV instance
