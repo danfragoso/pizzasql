@@ -19,6 +19,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/kvmanager"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
+	"github.com/danfragoso/pizzasql-next/pkg/pgserver"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
@@ -38,8 +39,13 @@ var (
 	httpCORS        = flag.Bool("http-cors", true, "Enable CORS")
 	httpAuth        = flag.Bool("http-auth", false, "Enable authentication")
 	httpCompression = flag.Bool("http-compression", true, "Enable HTTP response compression")
-	httpQuiet       = flag.Bool("quiet", false, "Disable request logging")
+	quiet           = flag.Bool("quiet", false, "Disable request/query logging")
 	apiKeys         = flag.String("api-keys", "", "Comma-separated API keys")
+
+	// PostgreSQL wire protocol server flags
+	pgEnable = flag.Bool("pg", false, "Enable PostgreSQL wire protocol server")
+	pgHost   = flag.String("pg-host", "localhost", "PostgreSQL server host")
+	pgPort   = flag.Int("pg-port", 5432, "PostgreSQL server port")
 
 	// Export/Import flags
 	exportFile   = flag.String("o", "", "Output file for export")
@@ -79,6 +85,12 @@ func main() {
 	// Check if HTTP server mode is enabled
 	if *httpEnable {
 		runHTTPServer()
+		return
+	}
+
+	// Check if PostgreSQL server mode is enabled
+	if *pgEnable {
+		runPGServer()
 		return
 	}
 
@@ -752,7 +764,7 @@ func runHTTPServer() {
 	config.EnableCORS = *httpCORS
 	config.EnableAuth = *httpAuth
 	config.EnableCompression = *httpCompression
-	config.EnableLogging = !*httpQuiet
+	config.EnableLogging = !*quiet
 
 	if *apiKeys != "" {
 		config.APIKeys = strings.Split(*apiKeys, ",")
@@ -821,6 +833,70 @@ func runHTTPServer() {
 		if err := pprofServer.Shutdown(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Error during pprof shutdown: %v\n", err)
 		}
+	}
+
+	fmt.Println("Server stopped")
+}
+
+func runPGServer() {
+	// Connect to PizzaKV
+	pool, err := storage.NewKVPool(*kvAddr, *poolSize, *timeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect to PizzaKV at %s: %v\n", *kvAddr, err)
+		fmt.Fprintf(os.Stderr, "Make sure PizzaKV is running: pizzakv\n")
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	// Create database manager for multi-database support
+	dbManagerConfig := &storage.DatabaseManagerConfig{
+		DefaultDatabase: *database,
+		AutoCreate:      true,
+	}
+	dbManager := storage.NewDatabaseManager(pool, dbManagerConfig)
+
+	// Configure PostgreSQL server
+	config := pgserver.DefaultConfig()
+	config.Host = *pgHost
+	config.Port = *pgPort
+	config.DefaultDatabase = *database
+	config.Quiet = *quiet
+
+	// Create and start server
+	server := pgserver.New(config, dbManager)
+
+	// Handle graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Start server in goroutine
+	go func() {
+		if err := server.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "PostgreSQL server error: %v\n", err)
+			os.Exit(1)
+		}
+	}()
+
+	fmt.Printf("PizzaSQL PostgreSQL Server started on %s:%d\n", *pgHost, *pgPort)
+	fmt.Printf("Default database: %s\n", *database)
+	fmt.Printf("PizzaKV: %s\n", *kvAddr)
+	fmt.Println()
+	fmt.Println("Connect using psql:")
+	fmt.Printf("  psql -h %s -p %d -d %s\n", *pgHost, *pgPort, *database)
+	fmt.Println()
+	fmt.Println("Or any PostgreSQL client library:")
+	fmt.Printf("  postgresql://%s:%d/%s\n", *pgHost, *pgPort, *database)
+	fmt.Println()
+	fmt.Println("Press Ctrl+C to stop")
+
+	<-stop
+	fmt.Println("\nShutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Error during shutdown: %v\n", err)
 	}
 
 	fmt.Println("Server stopped")

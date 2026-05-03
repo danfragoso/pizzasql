@@ -11,7 +11,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/md5"
+	"database/sql"
 	"flag"
 	"fmt"
 	"math"
@@ -24,6 +26,7 @@ import (
 	"time"
 
 	"github.com/goccy/go-json"
+	_ "github.com/lib/pq" // PostgreSQL driver
 )
 
 const engineName = "pizzasql"
@@ -81,6 +84,8 @@ type queryResponse struct {
 type runner struct {
 	baseURL    string
 	client     *http.Client
+	pgDB       *sql.DB // PostgreSQL connection (if using -pg flag)
+	usePG      bool    // Use PostgreSQL wire protocol instead of HTTP
 	verbose    bool
 	stopOnFail bool
 	passed     int
@@ -94,6 +99,10 @@ type runner struct {
 
 func main() {
 	urlFlag := flag.String("url", "http://localhost:8080", "PizzaSQL server URL")
+	pgFlag := flag.Bool("pg", false, "Use PostgreSQL wire protocol instead of HTTP")
+	pgHostFlag := flag.String("pg-host", "localhost", "PostgreSQL server host")
+	pgPortFlag := flag.Int("pg-port", 5432, "PostgreSQL server port")
+	pgDBFlag := flag.String("pg-db", "pizzasql", "PostgreSQL database name")
 	dirFlag := flag.String("dir", "testdata/sqllogictest", "Directory containing .test files")
 	fileFlag := flag.String("file", "", "Single .test file to run (overrides -dir)")
 	verboseFlag := flag.Bool("v", false, "Print each passing record")
@@ -104,9 +113,33 @@ func main() {
 	r := &runner{
 		baseURL:    strings.TrimRight(*urlFlag, "/"),
 		client:     &http.Client{Timeout: 120 * time.Second},
+		usePG:      *pgFlag,
 		verbose:    *verboseFlag,
 		stopOnFail: *stopFlag,
 		logPath:    *logFlag,
+	}
+
+	// If using PostgreSQL wire protocol, establish connection
+	if *pgFlag {
+		connStr := fmt.Sprintf("host=%s port=%d dbname=%s sslmode=disable",
+			*pgHostFlag, *pgPortFlag, *pgDBFlag)
+		db, err := sql.Open("postgres", connStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to connect to PostgreSQL: %v\n", err)
+			os.Exit(1)
+		}
+		defer db.Close()
+
+		// Test connection
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to ping PostgreSQL server: %v\n", err)
+			os.Exit(1)
+		}
+
+		r.pgDB = db
+		fmt.Printf("Connected to PostgreSQL at %s:%d (database: %s)\n", *pgHostFlag, *pgPortFlag, *pgDBFlag)
 	}
 
 	if *logFlag != "" {
@@ -583,6 +616,13 @@ func equalSlices(a, b []string) bool {
 }
 
 func (r *runner) execQuery(sql string) (*queryResponse, error) {
+	if r.usePG {
+		return r.execQueryPG(sql)
+	}
+	return r.execQueryHTTP(sql)
+}
+
+func (r *runner) execQueryHTTP(sql string) (*queryResponse, error) {
 	body, _ := json.Marshal(queryRequest{SQL: sql})
 	resp, err := r.client.Post(r.baseURL+"/query", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -593,6 +633,92 @@ func (r *runner) execQuery(sql string) (*queryResponse, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&qr); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
+	return &qr, nil
+}
+
+func (r *runner) execQueryPG(sql string) (*queryResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// Check if it's a query or statement
+	sqlUpper := strings.TrimSpace(strings.ToUpper(sql))
+	isSelect := strings.HasPrefix(sqlUpper, "SELECT") ||
+		strings.HasPrefix(sqlUpper, "PRAGMA") ||
+		strings.HasPrefix(sqlUpper, "EXPLAIN")
+
+	var qr queryResponse
+
+	if isSelect {
+		// Execute query and get results
+		rows, err := r.pgDB.QueryContext(ctx, sql)
+		if err != nil {
+			qr.Error = &struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}{
+				Code:    "QUERY_ERROR",
+				Message: err.Error(),
+			}
+			return &qr, nil
+		}
+		defer rows.Close()
+
+		// Get column information
+		colTypes, err := rows.ColumnTypes()
+		if err != nil {
+			return nil, fmt.Errorf("get column types: %w", err)
+		}
+
+		for _, ct := range colTypes {
+			qr.Columns = append(qr.Columns, struct {
+				Name string `json:"name"`
+				Type string `json:"type"`
+			}{
+				Name: ct.Name(),
+				Type: ct.DatabaseTypeName(),
+			})
+		}
+
+		// Read all rows
+		for rows.Next() {
+			values := make([]interface{}, len(colTypes))
+			valuePtrs := make([]interface{}, len(colTypes))
+			for i := range values {
+				valuePtrs[i] = &values[i]
+			}
+
+			if err := rows.Scan(valuePtrs...); err != nil {
+				return nil, fmt.Errorf("scan row: %w", err)
+			}
+
+			// Convert byte arrays to strings (PostgreSQL returns some types as []byte)
+			for i, v := range values {
+				if b, ok := v.([]byte); ok {
+					values[i] = string(b)
+				}
+			}
+
+			qr.Rows = append(qr.Rows, values)
+		}
+
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("rows error: %w", err)
+		}
+	} else {
+		// Execute statement (INSERT, UPDATE, DELETE, CREATE, etc.)
+		_, err := r.pgDB.ExecContext(ctx, sql)
+		if err != nil {
+			qr.Error = &struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}{
+				Code:    "EXEC_ERROR",
+				Message: err.Error(),
+			}
+			return &qr, nil
+		}
+	}
+
 	return &qr, nil
 }
 
