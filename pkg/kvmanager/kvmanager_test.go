@@ -1,39 +1,38 @@
 package kvmanager
 
-import (
-	"testing"
-)
+import "testing"
 
-func TestFindAvailablePort(t *testing.T) {
-	port, err := findAvailablePort()
-	if err != nil {
-		t.Fatalf("Failed to find available port: %v", err)
+func TestParseKVAddr(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantNetwork string
+		wantTarget  string
+	}{
+		{
+			name:        "tcp address",
+			input:       "localhost:8085",
+			wantNetwork: "tcp",
+			wantTarget:  "localhost:8085",
+		},
+		{
+			name:        "unix socket",
+			input:       "unix:.pizzakv.sock",
+			wantNetwork: "unix",
+			wantTarget:  ".pizzakv.sock",
+		},
 	}
 
-	if port < 1024 || port > 65535 {
-		t.Errorf("Port %d is outside valid range 1024-65535", port)
-	}
-}
-
-func TestFindAvailablePortInRange(t *testing.T) {
-	// Test PizzaKV range (1024-9999)
-	port, err := findAvailablePortInRange(1024, 9999)
-	if err != nil {
-		t.Fatalf("Failed to find available port: %v", err)
-	}
-
-	if port < 1024 || port > 9999 {
-		t.Errorf("Port %d is outside requested range 1024-9999", port)
-	}
-
-	// Test custom range
-	port, err = findAvailablePortInRange(5000, 5100)
-	if err != nil {
-		t.Fatalf("Failed to find available port in custom range: %v", err)
-	}
-
-	if port < 5000 || port > 5100 {
-		t.Errorf("Port %d is outside requested range 5000-5100", port)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			network, target := parseKVAddr(tt.input)
+			if network != tt.wantNetwork {
+				t.Errorf("Expected network %q, got %q", tt.wantNetwork, network)
+			}
+			if target != tt.wantTarget {
+				t.Errorf("Expected target %q, got %q", tt.wantTarget, target)
+			}
+		})
 	}
 }
 
@@ -147,19 +146,14 @@ func TestParsePort(t *testing.T) {
 func TestKVInfo(t *testing.T) {
 	info := &KVInfo{
 		PID:  12345,
-		Port: 8085,
-		Addr: "localhost:8085",
+		Addr: "unix:.pizzakv.sock",
 	}
 
 	if info.PID != 12345 {
 		t.Errorf("Expected PID 12345, got %d", info.PID)
 	}
 
-	if info.Port != 8085 {
-		t.Errorf("Expected Port 8085, got %d", info.Port)
-	}
-
-	if info.Addr != "localhost:8085" {
-		t.Errorf("Expected Addr 'localhost:8085', got %s", info.Addr)
+	if info.Addr != "unix:.pizzakv.sock" {
+		t.Errorf("Expected Addr 'unix:.pizzakv.sock', got %s", info.Addr)
 	}
 }

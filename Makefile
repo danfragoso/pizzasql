@@ -1,8 +1,21 @@
-.PHONY: build test test-v test-cover bench clean fmt lint sqllogictest sqllogictest-basic sqllogictest-download build-sqllogictest
+.PHONY: build test test-v test-cover bench clean fmt lint sqllogictest sqllogictest-basic sqllogictest-download build-sqllogictest install uninstall
+
+PREFIX ?= /usr/local
 
 # Build the project
 build:
 	go build -o ./bin/pizzasql ./main.go
+
+# Install pizzasql to PREFIX/bin (default: /usr/local/bin)
+install: build
+	sudo install -d $(DESTDIR)$(PREFIX)/bin
+	sudo install -m 755 ./bin/pizzasql $(DESTDIR)$(PREFIX)/bin/pizzasql
+	@echo "Installed to $(DESTDIR)$(PREFIX)/bin/pizzasql"
+
+# Remove installed binary
+uninstall:
+	sudo rm -f $(DESTDIR)$(PREFIX)/bin/pizzasql
+	@echo "Removed $(DESTDIR)$(PREFIX)/bin/pizzasql"
 
 build-linux-amd64:
 	GOOS=linux GOARCH=amd64 go build -o ./bin/pizzasql-linux-amd64 ./main.go

@@ -18,8 +18,10 @@ type KVClient struct {
 }
 
 // NewKVClient creates a new KV client connected to the given address.
+// addr may be "host:port" for TCP or "unix:<path>" for a Unix socket.
 func NewKVClient(addr string) (*KVClient, error) {
-	conn, err := net.Dial("tcp", addr)
+	network, target := parseAddr(addr)
+	conn, err := net.Dial(network, target)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to PizzaKV: %w", err)
 	}
@@ -29,6 +31,15 @@ func NewKVClient(addr string) (*KVClient, error) {
 		reader: bufio.NewReader(conn),
 		writer: bufio.NewWriter(conn),
 	}, nil
+}
+
+// parseAddr splits an addr string into (network, address).
+// "unix:<path>" → ("unix", "<path>"), anything else → ("tcp", addr).
+func parseAddr(addr string) (string, string) {
+	if strings.HasPrefix(addr, "unix:") {
+		return "unix", strings.TrimPrefix(addr, "unix:")
+	}
+	return "tcp", addr
 }
 
 // Close closes the connection.

@@ -20,19 +20,19 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/pgserver"
+	pizzaruntime "github.com/danfragoso/pizzasql-next/pkg/runtime"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
 var (
-	kvAddr          = flag.String("kvaddr", "localhost:8085", "PizzaKV server address (ignored if -kv is set)")
+	kvAddr          = flag.String("kvaddr", "", "PizzaKV server address (default: auto-connect to managed instance)")
 	kvLaunch        = flag.Bool("kv", false, "Launch PizzaKV automatically")
-	kvFlags         = flag.String("kvflags", "", "Flags to pass to PizzaKV (e.g., \"-iwal -port=9090\")")
-	kvInfoFile      = flag.String("kvinfo", ".pizzakv.json", "Path to PizzaKV info file")
+	kvFlags         = flag.String("kvflags", "", "Flags to pass to PizzaKV (e.g., \"-iwal\")")
 	database        = flag.String("db", "pizzasql", "Database name")
-	poolSize        = flag.Int("pool", 5, "Connection pool size")
-	timeout         = flag.Duration("timeout", 30*time.Second, "Query timeout")
+	poolSize        = flag.Int("pool", 100, "Connection pool size")
+	timeout         = flag.Duration("timeout", 120*time.Second, "Query timeout")
 	httpEnable      = flag.Bool("http", false, "Enable HTTP server")
 	httpHost        = flag.String("http-host", "localhost", "HTTP server host")
 	httpPort        = flag.Int("http-port", 8080, "HTTP server port")
@@ -63,34 +63,52 @@ var startPprofServerHook func() *http.Server
 func main() {
 	flag.Parse()
 
-	// If -kv flag is set, launch PizzaKV
+	// Warn if other pizzasql instances are running; prompt to continue.
+	if err := pizzaruntime.CheckExistingInstances(); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	// Register this process in its own runtime directory.
+	pizzaruntime.WritePizzaSQL(os.Getpid(), 0, 0)
+	defer pizzaruntime.Cleanup()
+
+	// Set up signal handling for graceful shutdown.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\nShutting down...")
+		stopPizzaKV()
+		pizzaruntime.Cleanup()
+		os.Exit(0)
+	}()
+
+	// If -kv flag is set, always launch a dedicated PizzaKV for this instance.
 	if *kvLaunch {
 		if err := launchPizzaKV(); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to launch PizzaKV: %v\n", err)
 			os.Exit(1)
 		}
 		defer stopPizzaKV()
-
-		// Set up signal handling for graceful shutdown
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-		go func() {
-			<-sigChan
-			fmt.Println("\nShutting down...")
-			stopPizzaKV()
-			os.Exit(0)
-		}()
+	} else if *kvAddr == "" {
+		*kvAddr = "localhost:8085"
 	}
 
-	// Check if HTTP server mode is enabled
-	if *httpEnable {
-		runHTTPServer()
-		return
-	}
-
-	// Check if PostgreSQL server mode is enabled
-	if *pgEnable {
-		runPGServer()
+	// Start whichever servers are enabled, then block until signal.
+	if *httpEnable || *pgEnable {
+		httpRuntimePort := 0
+		pgRuntimePort := 0
+		if *httpEnable {
+			httpRuntimePort = *httpPort
+		}
+		if *pgEnable {
+			pgRuntimePort = *pgPort
+		}
+		if err := pizzaruntime.WritePizzaSQL(os.Getpid(), httpRuntimePort, pgRuntimePort); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to write runtime info: %v\n", err)
+		}
+		runServers()
 		return
 	}
 
@@ -740,186 +758,110 @@ func detectFileFormat(filename string) string {
 	return "sql"
 }
 
-func runHTTPServer() {
-	// Connect to PizzaKV
+func runServers() {
 	pool, err := storage.NewKVPool(*kvAddr, *poolSize, *timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to connect to PizzaKV at %s: %v\n", *kvAddr, err)
-		fmt.Fprintf(os.Stderr, "Make sure PizzaKV is running: pizzakv\n")
 		os.Exit(1)
 	}
 	defer pool.Close()
 
-	// Create database manager for multi-database support
-	dbManagerConfig := &storage.DatabaseManagerConfig{
-		DefaultDatabase: *database,
-		AutoCreate:      true, // Auto-create databases on first access
-	}
-	dbManager := storage.NewDatabaseManager(pool, dbManagerConfig)
-
-	// Configure HTTP server
-	config := httpserver.DefaultConfig()
-	config.Host = *httpHost
-	config.Port = *httpPort
-	config.EnableCORS = *httpCORS
-	config.EnableAuth = *httpAuth
-	config.EnableCompression = *httpCompression
-	config.EnableLogging = !*quiet
-
-	if *apiKeys != "" {
-		config.APIKeys = strings.Split(*apiKeys, ",")
-	}
-
-	// Create and start server with multi-database support
-	server := httpserver.NewWithDatabaseManager(config, dbManager)
-	var pprofServer *http.Server
-	if startPprofServerHook != nil {
-		pprofServer = startPprofServerHook()
-	}
-
-	// Handle graceful shutdown
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	// Start server in goroutine
-	go func() {
-		if err := server.Start(); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "HTTP server error: %v\n", err)
-			os.Exit(1)
-		}
-	}()
-
-	fmt.Printf("PizzaSQL HTTP server started on http://%s:%d\n", *httpHost, *httpPort)
-	if pprofServer != nil {
-		fmt.Printf("pprof debug server started on http://%s/debug/pprof/\n", pprofServer.Addr)
-	}
-	fmt.Printf("Default database: %s\n", *database)
-	fmt.Printf("PizzaKV: %s\n", *kvAddr)
-	fmt.Println()
-	fmt.Println("Multi-database support enabled!")
-	fmt.Println("Use the X-Database header to select a database per request.")
-	fmt.Println()
-	fmt.Println("Endpoints:")
-	fmt.Println("  POST   /query                - Execute SQL query")
-	fmt.Println("  POST   /execute              - Batch execution")
-	fmt.Println("  GET    /schema/tables        - List tables")
-	fmt.Println("  GET    /schema/tables/{name} - Table schema")
-	fmt.Println("  GET    /health               - Health check")
-	fmt.Println("  GET    /stats                - Statistics")
-	fmt.Println("  GET    /metrics              - Prometheus metrics")
-	fmt.Println("  POST   /transaction/begin    - Begin transaction")
-	fmt.Println("  POST   /transaction/commit   - Commit transaction")
-	fmt.Println("  POST   /transaction/rollback - Rollback transaction")
-	fmt.Println()
-	fmt.Println("Examples:")
-	fmt.Printf("  # Query default database\n")
-	fmt.Printf("  curl -X POST http://%s:%d/query -H 'Content-Type: application/json' -d '{\"sql\":\"SELECT 1+1\"}'\n", *httpHost, *httpPort)
-	fmt.Println()
-	fmt.Printf("  # Query specific database using X-Database header\n")
-	fmt.Printf("  curl -X POST http://%s:%d/query -H 'Content-Type: application/json' -H 'X-Database: tenant_db' -d '{\"sql\":\"SELECT * FROM users\"}'\n", *httpHost, *httpPort)
-	fmt.Println()
-	fmt.Println("Press Ctrl+C to stop")
-
-	<-stop
-	fmt.Println("\nShutting down server...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error during shutdown: %v\n", err)
-	}
-	if pprofServer != nil {
-		if err := pprofServer.Shutdown(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Error during pprof shutdown: %v\n", err)
-		}
-	}
-
-	fmt.Println("Server stopped")
-}
-
-func runPGServer() {
-	// Connect to PizzaKV
-	pool, err := storage.NewKVPool(*kvAddr, *poolSize, *timeout)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to PizzaKV at %s: %v\n", *kvAddr, err)
-		fmt.Fprintf(os.Stderr, "Make sure PizzaKV is running: pizzakv\n")
-		os.Exit(1)
-	}
-	defer pool.Close()
-
-	// Create database manager for multi-database support
 	dbManagerConfig := &storage.DatabaseManagerConfig{
 		DefaultDatabase: *database,
 		AutoCreate:      true,
 	}
 	dbManager := storage.NewDatabaseManager(pool, dbManagerConfig)
 
-	// Configure PostgreSQL server
-	config := pgserver.DefaultConfig()
-	config.Host = *pgHost
-	config.Port = *pgPort
-	config.DefaultDatabase = *database
-	config.Quiet = *quiet
-
-	// Create and start server
-	server := pgserver.New(config, dbManager)
-
-	// Handle graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	// Start server in goroutine
-	go func() {
-		if err := server.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "PostgreSQL server error: %v\n", err)
-			os.Exit(1)
-		}
-	}()
+	var httpSrv *httpserver.Server
+	var pprofSrv *http.Server
+	var pgSrv *pgserver.Server
 
-	fmt.Printf("PizzaSQL PostgreSQL Server started on %s:%d\n", *pgHost, *pgPort)
-	fmt.Printf("Default database: %s\n", *database)
-	fmt.Printf("PizzaKV: %s\n", *kvAddr)
-	fmt.Println()
-	fmt.Println("Connect using psql:")
-	fmt.Printf("  psql -h %s -p %d -d %s\n", *pgHost, *pgPort, *database)
-	fmt.Println()
-	fmt.Println("Or any PostgreSQL client library:")
-	fmt.Printf("  postgresql://%s:%d/%s\n", *pgHost, *pgPort, *database)
-	fmt.Println()
+	if *httpEnable {
+		config := httpserver.DefaultConfig()
+		config.Host = *httpHost
+		config.Port = *httpPort
+		config.EnableCORS = *httpCORS
+		config.EnableAuth = *httpAuth
+		config.EnableCompression = *httpCompression
+		config.EnableLogging = !*quiet
+		if *apiKeys != "" {
+			config.APIKeys = strings.Split(*apiKeys, ",")
+		}
+		httpSrv = httpserver.NewWithDatabaseManager(config, dbManager)
+		if startPprofServerHook != nil {
+			pprofSrv = startPprofServerHook()
+		}
+		go func() {
+			if err := httpSrv.Start(); err != nil && err != http.ErrServerClosed {
+				fmt.Fprintf(os.Stderr, "HTTP server error: %v\n", err)
+				os.Exit(1)
+			}
+		}()
+		fmt.Printf("HTTP  http://%s:%d\n", *httpHost, *httpPort)
+	}
+
+	if *pgEnable {
+		config := pgserver.DefaultConfig()
+		config.Host = *pgHost
+		config.Port = *pgPort
+		config.DefaultDatabase = *database
+		config.Quiet = *quiet
+		pgSrv = pgserver.New(config, dbManager)
+		go func() {
+			if err := pgSrv.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "PostgreSQL server error: %v\n", err)
+				os.Exit(1)
+			}
+		}()
+		fmt.Printf("PG    postgresql://%s:%d/%s\n", *pgHost, *pgPort, *database)
+	}
+
+	fmt.Printf("KV    %s\n", *kvAddr)
+	fmt.Printf("DB    %s\n", *database)
 	fmt.Println("Press Ctrl+C to stop")
 
 	<-stop
-	fmt.Println("\nShutting down server...")
+	fmt.Println("\nShutting down...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := server.Shutdown(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error during shutdown: %v\n", err)
+	if httpSrv != nil {
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "HTTP shutdown error: %v\n", err)
+		}
 	}
-
-	fmt.Println("Server stopped")
+	if pprofSrv != nil {
+		pprofSrv.Shutdown(ctx)
+	}
+	if pgSrv != nil {
+		if err := pgSrv.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "PG shutdown error: %v\n", err)
+		}
+	}
 }
 
-// launchPizzaKV starts a PizzaKV instance and updates kvAddr
+// launchPizzaKV starts a dedicated PizzaKV instance for this pizzasql process.
 func launchPizzaKV() error {
-	kvManager = kvmanager.NewManager()
-	kvManager.SetInfoFile(*kvInfoFile)
-
-	// Clean up any stale process info
-	if err := kvmanager.CleanupStaleProcess(*kvInfoFile); err != nil {
-		// Check if it's an "already running" error
-		if strings.Contains(err.Error(), "already running") {
-			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
-			fmt.Fprintf(os.Stderr, "\nOptions:\n")
-			fmt.Fprintf(os.Stderr, "  1. Use the existing instance: remove -kv flag and use -kvaddr=localhost:<port>\n")
-			fmt.Fprintf(os.Stderr, "  2. Stop it: kill %d\n", getPIDFromFile(*kvInfoFile))
-			fmt.Fprintf(os.Stderr, "  3. Delete the info file: rm %s\n\n", *kvInfoFile)
-			return err
+	if _, err := os.Stat(".db"); err == nil {
+		if live := pizzaruntime.LiveInstances(); len(live) > 0 {
+			inst := live[0]
+			kvAddr := "<addr>"
+			if inst.PizzaKV != nil {
+				kvAddr = inst.PizzaKV.Addr
+			}
+			return fmt.Errorf(".db file already exists and another pizzasql instance is running (PID %d)\n"+
+				"  To connect to its pizzakv:      pizzasql -kvaddr=%s\n"+
+				"  To start fresh (removes data):  rm .db && pizzasql -kv\n"+
+				"  To run a separate instance:     cd /other/dir && pizzasql -kv",
+				inst.PizzaSQL.PID, kvAddr)
 		}
-		return fmt.Errorf("failed to cleanup stale process: %w", err)
 	}
+
+	kvManager = kvmanager.NewManager()
 
 	fmt.Println("Starting PizzaKV...")
 	info, err := kvManager.Start(*kvFlags)
@@ -927,13 +869,11 @@ func launchPizzaKV() error {
 		return err
 	}
 
-	fmt.Printf("\nPizzaKV started on %s (PID: %d)\n", info.Addr, info.PID)
-	fmt.Printf("Info written to: %s\n", *kvInfoFile)
+	fmt.Printf("PizzaKV started on %s (PID: %d)\n", info.Addr, info.PID)
+	fmt.Printf("Runtime: %s\n", pizzaruntime.File)
 	fmt.Println("PizzaKV is ready!")
 
-	// Update kvAddr to use the launched instance
 	*kvAddr = info.Addr
-
 	return nil
 }
 
@@ -947,15 +887,4 @@ func stopPizzaKV() {
 			fmt.Println("PizzaKV stopped")
 		}
 	}
-}
-
-// getPIDFromFile reads the PID from the info file
-func getPIDFromFile(path string) int {
-	mgr := kvmanager.NewManager()
-	mgr.SetInfoFile(path)
-	info, err := mgr.LoadInfo()
-	if err != nil {
-		return 0
-	}
-	return info.PID
 }

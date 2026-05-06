@@ -82,6 +82,11 @@ func (m *SchemaManager) catalogKey() string {
 	return fmt.Sprintf("%s:_sys:tables", m.database)
 }
 
+// rowIDKey returns the key for a table's next ROWID counter.
+func (m *SchemaManager) rowIDKey(table string) string {
+	return fmt.Sprintf("%s:_sys:rowid:%s", m.database, strings.ToLower(table))
+}
+
 // CreateTable creates a new table.
 func (m *SchemaManager) CreateTable(schema *Schema) error {
 	m.mu.Lock()
@@ -182,6 +187,11 @@ func (m *SchemaManager) DropTable(name string) error {
 	if err != nil {
 		return fmt.Errorf("failed to delete schema: %w", err)
 	}
+
+	// Delete ROWID state.
+	m.pool.WithClient(func(c *KVClient) error {
+		return c.Delete(m.rowIDKey(name))
+	})
 
 	// Update catalog
 	if err := m.removeFromCatalog(name); err != nil {
@@ -361,19 +371,16 @@ func (m *SchemaManager) GetNextRowID(table string) (int64, error) {
 		return 0, err
 	}
 
-	// Get current and increment
-	rowid := schema.NextRowID
-	if rowid == 0 {
-		rowid = 1
-	}
-	schema.NextRowID = rowid + 1
-
-	// Save updated schema
-	if err := m.saveSchemaLocked(schema); err != nil {
+	nextRowID, err := m.getNextRowIDLocked(schema)
+	if err != nil {
 		return 0, err
 	}
 
-	return rowid, nil
+	if err := m.saveNextRowIDLocked(schema.Name, nextRowID+1); err != nil {
+		return 0, err
+	}
+
+	return nextRowID, nil
 }
 
 // UpdateMaxRowID updates the next ROWID if the provided value is higher.
@@ -386,11 +393,63 @@ func (m *SchemaManager) UpdateMaxRowID(table string, rowid int64) error {
 		return err
 	}
 
-	if rowid >= schema.NextRowID {
-		schema.NextRowID = rowid + 1
-		return m.saveSchemaLocked(schema)
+	nextRowID, err := m.getNextRowIDLocked(schema)
+	if err != nil {
+		return err
 	}
 
+	if rowid >= nextRowID {
+		return m.saveNextRowIDLocked(schema.Name, rowid+1)
+	}
+
+	return nil
+}
+
+// getNextRowIDLocked reads a table's next ROWID counter (must hold lock).
+func (m *SchemaManager) getNextRowIDLocked(schema *Schema) (int64, error) {
+	key := m.rowIDKey(schema.Name)
+	var data string
+	err := m.pool.WithClient(func(c *KVClient) error {
+		var err error
+		data, err = c.Read(key)
+		return err
+	})
+	if err == nil {
+		var nextRowID int64
+		if _, scanErr := fmt.Sscanf(data, "%d", &nextRowID); scanErr != nil {
+			return 0, fmt.Errorf("failed to parse rowid counter: %w", scanErr)
+		}
+		if nextRowID < 1 {
+			nextRowID = 1
+		}
+		return nextRowID, nil
+	}
+	if err != ErrKeyNotFound {
+		return 0, err
+	}
+
+	if schema.NextRowID > 0 {
+		return schema.NextRowID, nil
+	}
+	return 1, nil
+}
+
+// saveNextRowIDLocked saves a table's next ROWID counter (must hold lock).
+func (m *SchemaManager) saveNextRowIDLocked(table string, nextRowID int64) error {
+	if nextRowID < 1 {
+		nextRowID = 1
+	}
+
+	err := m.pool.WithClient(func(c *KVClient) error {
+		return c.Write(m.rowIDKey(table), fmt.Sprintf("%d", nextRowID))
+	})
+	if err != nil {
+		return fmt.Errorf("failed to write rowid counter: %w", err)
+	}
+
+	if schema, ok := m.cache[strings.ToLower(table)]; ok {
+		schema.NextRowID = nextRowID
+	}
 	return nil
 }
 
@@ -722,6 +781,16 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 	// Update schema name
 	schema.Name = newName
 
+	var nextRowID string
+	rowIDKey := m.rowIDKey(oldName)
+	m.pool.WithClient(func(c *KVClient) error {
+		data, err := c.Read(rowIDKey)
+		if err == nil {
+			nextRowID = data
+		}
+		return nil
+	})
+
 	// Delete old schema
 	oldKey := m.schemaKey(oldName)
 	err = m.pool.WithClient(func(c *KVClient) error {
@@ -733,6 +802,19 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 
 	// Remove from catalog
 	m.removeFromCatalog(oldName)
+
+	// Move ROWID state.
+	m.pool.WithClient(func(c *KVClient) error {
+		return c.Delete(rowIDKey)
+	})
+	if nextRowID != "" {
+		err = m.pool.WithClient(func(c *KVClient) error {
+			return c.Write(m.rowIDKey(newName), nextRowID)
+		})
+		if err != nil {
+			return err
+		}
+	}
 
 	// Update cache
 	delete(m.cache, strings.ToLower(oldName))
