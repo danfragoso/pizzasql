@@ -47,18 +47,21 @@ type IndexColumn struct {
 
 // SchemaManager manages table schemas.
 type SchemaManager struct {
-	pool     *KVPool
-	database string
-	cache    map[string]*Schema
-	mu       sync.RWMutex
+	pool             *KVPool
+	database         string
+	cache            map[string]*Schema
+	rowIDInitialized map[string]bool
+	version          uint64
+	mu               sync.RWMutex
 }
 
 // NewSchemaManager creates a new schema manager.
 func NewSchemaManager(pool *KVPool, database string) *SchemaManager {
 	return &SchemaManager{
-		pool:     pool,
-		database: database,
-		cache:    make(map[string]*Schema),
+		pool:             pool,
+		database:         database,
+		cache:            make(map[string]*Schema),
+		rowIDInitialized: make(map[string]bool),
 	}
 }
 
@@ -70,6 +73,19 @@ func (m *SchemaManager) GetDatabaseName() string {
 // GetPool returns the KV pool.
 func (m *SchemaManager) GetPool() *KVPool {
 	return m.pool
+}
+
+// Version returns the in-process schema catalog version. It is incremented for
+// schema/index definition changes so cached executors can resync their analyzer
+// catalogs without scanning storage on every query.
+func (m *SchemaManager) Version() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.version
+}
+
+func (m *SchemaManager) bumpVersionLocked() {
+	m.version++
 }
 
 // schemaKey returns the key for a table schema.
@@ -145,6 +161,7 @@ func (m *SchemaManager) CreateTable(schema *Schema) error {
 
 	// Update cache
 	m.cache[strings.ToLower(schema.Name)] = schema
+	m.bumpVersionLocked()
 
 	return nil
 }
@@ -199,7 +216,10 @@ func (m *SchemaManager) DropTable(name string) error {
 	}
 
 	// Update cache
-	delete(m.cache, strings.ToLower(name))
+	tableLower := strings.ToLower(name)
+	delete(m.cache, tableLower)
+	delete(m.rowIDInitialized, tableLower)
+	m.bumpVersionLocked()
 
 	return nil
 }
@@ -328,7 +348,9 @@ func (m *SchemaManager) removeFromCatalog(name string) error {
 func (m *SchemaManager) InvalidateCache(name string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.cache, strings.ToLower(name))
+	tableLower := strings.ToLower(name)
+	delete(m.cache, tableLower)
+	delete(m.rowIDInitialized, tableLower)
 }
 
 // ToAnalyzerTableInfo converts a Schema to analyzer.TableInfo.
@@ -376,9 +398,7 @@ func (m *SchemaManager) GetNextRowID(table string) (int64, error) {
 		return 0, err
 	}
 
-	if err := m.saveNextRowIDLocked(schema.Name, nextRowID+1); err != nil {
-		return 0, err
-	}
+	schema.NextRowID = nextRowID + 1
 
 	return nextRowID, nil
 }
@@ -399,58 +419,79 @@ func (m *SchemaManager) UpdateMaxRowID(table string, rowid int64) error {
 	}
 
 	if rowid >= nextRowID {
-		return m.saveNextRowIDLocked(schema.Name, rowid+1)
+		schema.NextRowID = rowid + 1
 	}
 
 	return nil
 }
 
-// getNextRowIDLocked reads a table's next ROWID counter (must hold lock).
+// getNextRowIDLocked returns a table's in-memory ROWID counter (must hold lock).
+// On first use after startup, the counter is derived from durable row data so
+// ROWID movement does not add a separate WAL entry.
 func (m *SchemaManager) getNextRowIDLocked(schema *Schema) (int64, error) {
-	key := m.rowIDKey(schema.Name)
-	var data string
-	err := m.pool.WithClient(func(c *KVClient) error {
-		var err error
-		data, err = c.Read(key)
-		return err
-	})
-	if err == nil {
-		var nextRowID int64
-		if _, scanErr := fmt.Sscanf(data, "%d", &nextRowID); scanErr != nil {
-			return 0, fmt.Errorf("failed to parse rowid counter: %w", scanErr)
+	tableLower := strings.ToLower(schema.Name)
+	if m.rowIDInitialized[tableLower] {
+		if schema.NextRowID < 1 {
+			schema.NextRowID = 1
 		}
-		if nextRowID < 1 {
-			nextRowID = 1
-		}
-		return nextRowID, nil
-	}
-	if err != ErrKeyNotFound {
-		return 0, err
-	}
-
-	if schema.NextRowID > 0 {
 		return schema.NextRowID, nil
 	}
-	return 1, nil
-}
 
-// saveNextRowIDLocked saves a table's next ROWID counter (must hold lock).
-func (m *SchemaManager) saveNextRowIDLocked(table string, nextRowID int64) error {
+	nextRowID, err := m.deriveNextRowIDLocked(schema)
+	if err != nil {
+		return 0, err
+	}
+	if schema.NextRowID > nextRowID {
+		nextRowID = schema.NextRowID
+	}
 	if nextRowID < 1 {
 		nextRowID = 1
 	}
 
+	schema.NextRowID = nextRowID
+	m.rowIDInitialized[tableLower] = true
+	return schema.NextRowID, nil
+}
+
+// deriveNextRowIDLocked scans durable row values to recover max(rowid)+1.
+func (m *SchemaManager) deriveNextRowIDLocked(schema *Schema) (int64, error) {
+	prefix := fmt.Sprintf("%s:_data:%s:", m.database, strings.ToLower(schema.Name))
+	var values []string
 	err := m.pool.WithClient(func(c *KVClient) error {
-		return c.Write(m.rowIDKey(table), fmt.Sprintf("%d", nextRowID))
+		var err error
+		values, err = c.Reads(prefix)
+		return err
 	})
 	if err != nil {
-		return fmt.Errorf("failed to write rowid counter: %w", err)
+		return 0, err
 	}
 
-	if schema, ok := m.cache[strings.ToLower(table)]; ok {
-		schema.NextRowID = nextRowID
+	var maxRowID int64
+	for _, value := range values {
+		var row Row
+		if err := json.Unmarshal([]byte(value), &row); err != nil {
+			return 0, fmt.Errorf("failed to parse row while deriving ROWID: %w", err)
+		}
+
+		if rowid, ok := valueAsInt64(row["_rowid_"]); ok && rowid > maxRowID {
+			maxRowID = rowid
+		}
 	}
-	return nil
+
+	return maxRowID + 1, nil
+}
+
+func valueAsInt64(value interface{}) (int64, bool) {
+	switch v := value.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
 }
 
 // getSchemaLocked retrieves schema (must hold lock).
@@ -548,7 +589,11 @@ func (m *SchemaManager) CreateIndex(index *Index) error {
 	}
 
 	// Add to index list
-	return m.addToIndexList(index.Name)
+	if err := m.addToIndexList(index.Name); err != nil {
+		return err
+	}
+	m.bumpVersionLocked()
+	return nil
 }
 
 // DropIndex drops an index.
@@ -564,7 +609,11 @@ func (m *SchemaManager) DropIndex(name string) error {
 		return fmt.Errorf("failed to delete index: %w", err)
 	}
 
-	return m.removeFromIndexList(name)
+	if err := m.removeFromIndexList(name); err != nil {
+		return err
+	}
+	m.bumpVersionLocked()
+	return nil
 }
 
 // IndexExists checks if an index exists.
@@ -781,15 +830,7 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 	// Update schema name
 	schema.Name = newName
 
-	var nextRowID string
 	rowIDKey := m.rowIDKey(oldName)
-	m.pool.WithClient(func(c *KVClient) error {
-		data, err := c.Read(rowIDKey)
-		if err == nil {
-			nextRowID = data
-		}
-		return nil
-	})
 
 	// Delete old schema
 	oldKey := m.schemaKey(oldName)
@@ -807,17 +848,13 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 	m.pool.WithClient(func(c *KVClient) error {
 		return c.Delete(rowIDKey)
 	})
-	if nextRowID != "" {
-		err = m.pool.WithClient(func(c *KVClient) error {
-			return c.Write(m.rowIDKey(newName), nextRowID)
-		})
-		if err != nil {
-			return err
-		}
-	}
 
 	// Update cache
-	delete(m.cache, strings.ToLower(oldName))
+	oldLower := strings.ToLower(oldName)
+	newLower := strings.ToLower(newName)
+	wasInitialized := m.rowIDInitialized[oldLower]
+	delete(m.cache, oldLower)
+	delete(m.rowIDInitialized, oldLower)
 
 	// Write new schema
 	newKey := m.schemaKey(newName)
@@ -833,7 +870,11 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 	m.addToCatalog(newName)
 
 	// Update cache
-	m.cache[strings.ToLower(newName)] = schema
+	m.cache[newLower] = schema
+	if wasInitialized {
+		m.rowIDInitialized[newLower] = true
+	}
+	m.bumpVersionLocked()
 
 	return nil
 }
@@ -922,5 +963,6 @@ func (m *SchemaManager) updateSchemaUnsafe(schema *Schema) error {
 
 	// Update cache
 	m.cache[strings.ToLower(schema.Name)] = schema
+	m.bumpVersionLocked()
 	return nil
 }

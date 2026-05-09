@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -19,6 +20,8 @@ type Executor struct {
 	table    *storage.TableManager
 	analyzer *analyzer.Analyzer
 	catalog  *analyzer.Catalog
+	// Last SchemaManager version reflected in catalog.
+	catalogVersion uint64
 
 	// Multi-database support
 	attachedDatabases map[string]*DatabaseConnection // alias -> connection
@@ -36,8 +39,23 @@ type Executor struct {
 	// Keyed by subquery AST pointer; valid for one top-level Execute call.
 	subqueryCache map[*parser.SelectStmt]*Result
 
+	// Per-query cache for decorrelated scalar aggregate subqueries.
+	// Keyed by subquery AST pointer; valid for one top-level Execute call.
+	correlatedAggCache map[*parser.SelectStmt]*correlatedAggCache
+
 	// In-memory view registry: view name (lowercase) → SELECT AST.
 	views map[string]*parser.SelectStmt
+}
+
+type correlatedAggCache struct {
+	values       map[string]interface{}
+	defaultValue interface{}
+}
+
+type correlatedAggSpec struct {
+	innerKey parser.Expr
+	outerKey *parser.ColumnRef
+	aggExpr  parser.Expr
 }
 
 // DatabaseConnection represents an attached database.
@@ -87,7 +105,9 @@ func (e *Executor) SyncCatalog() error {
 		return err
 	}
 
+	storageTables := make(map[string]struct{}, len(tables))
 	for _, tableName := range tables {
+		storageTables[strings.ToUpper(tableName)] = struct{}{}
 		schema, err := e.schema.GetSchema(tableName)
 		if err != nil {
 			continue
@@ -96,14 +116,27 @@ func (e *Executor) SyncCatalog() error {
 		e.catalog.DropTable(tableName)
 		e.catalog.CreateTable(schema.ToAnalyzerTableInfo())
 	}
+	for _, table := range e.catalog.GetTables() {
+		if table.IsView {
+			continue
+		}
+		if _, exists := storageTables[strings.ToUpper(table.Name)]; !exists {
+			e.catalog.DropTable(table.Name)
+		}
+	}
 
+	e.catalogVersion = e.schema.Version()
 	return nil
 }
 
 // Execute executes a SQL statement.
 func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	e.subqueryCache = make(map[*parser.SelectStmt]*Result)
-	defer func() { e.subqueryCache = nil }()
+	e.correlatedAggCache = make(map[*parser.SelectStmt]*correlatedAggCache)
+	defer func() {
+		e.subqueryCache = nil
+		e.correlatedAggCache = nil
+	}()
 
 	// PRAGMA doesn't need analysis
 	if pragma, ok := stmt.(*parser.PragmaStmt); ok {
@@ -141,10 +174,10 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 		return e.executeDetach(s)
 	}
 
-	// Analyze first — create a fresh analyzer per call so concurrent requests
-	// don't share mutable scope state (e.analyzer.scope would race otherwise).
-	a := analyzer.New(e.catalog)
-	if err := a.Analyze(stmt); err != nil {
+	// Analyze first. If the cached analyzer catalog is stale because schema was
+	// changed through another executor/API path, resync from storage and retry
+	// once before returning table/column-not-found errors.
+	if err := e.analyzeWithCatalogRetry(stmt); err != nil {
 		return nil, err
 	}
 
@@ -170,6 +203,39 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", stmt)
 	}
+}
+
+func (e *Executor) analyzeWithCatalogRetry(stmt parser.Statement) error {
+	if e.catalogVersion != e.schema.Version() {
+		if err := e.SyncCatalog(); err != nil {
+			return err
+		}
+	}
+
+	a := analyzer.New(e.catalog)
+	err := a.Analyze(stmt)
+	if err == nil {
+		return nil
+	}
+	if !isCatalogMiss(err) {
+		return err
+	}
+
+	if syncErr := e.SyncCatalog(); syncErr != nil {
+		return err
+	}
+
+	a = analyzer.New(e.catalog)
+	return a.Analyze(stmt)
+}
+
+func isCatalogMiss(err error) bool {
+	var analysisErr *analyzer.AnalysisError
+	if !errors.As(err, &analysisErr) {
+		return false
+	}
+	return analysisErr.Type == analyzer.ErrTableNotFound ||
+		analysisErr.Type == analyzer.ErrColumnNotFound
 }
 
 // executeSelect executes a SELECT statement (or compound SELECT).
@@ -1346,20 +1412,12 @@ func (e *Executor) executeAggregateSelect(stmt *parser.SelectStmt, rows []storag
 
 // executeGroupBy executes a GROUP BY query.
 func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, schema *storage.Schema) (*Result, error) {
-	// Group rows
-	groups := make(map[string][]storage.Row)
-	for _, row := range rows {
-		key := e.buildGroupKey(stmt.GroupBy, row)
-		groups[key] = append(groups[key], row)
-	}
-
 	result := NewResult("SELECT")
 
 	// Expand SELECT * if present
-	expandedColumns := make([]parser.SelectColumn, 0)
+	expandedColumns := make([]parser.SelectColumn, 0, len(stmt.Columns))
 	for _, col := range stmt.Columns {
 		if col.Star {
-			// Expand * to all columns from schema
 			for _, c := range schema.Columns {
 				expandedColumns = append(expandedColumns, parser.SelectColumn{
 					Expr: &parser.ColumnRef{Column: c.Name},
@@ -1370,7 +1428,7 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, s
 		}
 	}
 
-	// Determine columns
+	// Determine column names
 	columnNames := make([]string, len(expandedColumns))
 	for i, col := range expandedColumns {
 		if col.Alias != "" {
@@ -1385,16 +1443,27 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, s
 		}
 	}
 
-	// Process each group
+	// Fast path: use running accumulators instead of collecting rows per group.
+	// Applicable when there is no HAVING clause and all aggregate SELECT columns
+	// are direct FunctionCalls (COUNT/SUM/AVG/MIN/MAX).
+	if e.canUseGroupAccum(stmt, expandedColumns) {
+		return e.executeGroupByAccum(stmt, rows, result, expandedColumns, columnNames)
+	}
+
+	// Slow path: collect full rows per group then evaluate aggregates over them.
+	groups := make(map[string][]storage.Row)
+	for _, row := range rows {
+		key := e.buildGroupKey(stmt.GroupBy, row)
+		groups[key] = append(groups[key], row)
+	}
+
 	for _, groupRows := range groups {
-		// Apply HAVING
 		if stmt.Having != nil {
 			val, err := e.evalAggregateExpr(stmt.Having, groupRows)
 			if err != nil || val == nil || !toBool(val) {
 				continue
 			}
 		}
-
 		values := make([]interface{}, len(expandedColumns))
 		for i, col := range expandedColumns {
 			if e.isAggregate(col.Expr) {
@@ -1404,7 +1473,6 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, s
 				}
 				values[i] = val
 			} else {
-				// Use first row's value for non-aggregate columns
 				val, err := e.evalExpr(col.Expr, groupRows[0])
 				if err != nil {
 					return nil, err
@@ -1415,17 +1483,221 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, s
 		result.AddRow(values...)
 	}
 
-	// Apply DISTINCT
+	return e.finalizeGroupResult(stmt, result, expandedColumns, columnNames)
+}
+
+// canUseGroupAccum returns true when the fast accumulator path can handle the query.
+func (e *Executor) canUseGroupAccum(stmt *parser.SelectStmt, expandedColumns []parser.SelectColumn) bool {
+	if stmt.Having != nil {
+		return false
+	}
+	for _, col := range expandedColumns {
+		if !e.isAggregate(col.Expr) {
+			continue
+		}
+		fn, ok := col.Expr.(*parser.FunctionCall)
+		if !ok {
+			return false
+		}
+		switch strings.ToUpper(fn.Name) {
+		case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// aggColInfo pairs a SELECT column index with its aggregate FunctionCall.
+type aggColInfo struct {
+	colIdx int
+	fn     *parser.FunctionCall
+}
+
+// aggAccum holds running state for a single aggregate function.
+type aggAccum struct {
+	count   int64
+	sumI    int64
+	sumF    float64
+	allInt  bool
+	hasVal  bool
+	extreme interface{}
+	seen    map[interface{}]struct{} // for DISTINCT
+}
+
+// groupAccumState holds per-group state for the fast accumulator path.
+type groupAccumState struct {
+	firstRow storage.Row
+	accums   []*aggAccum
+}
+
+// executeGroupByAccum is the fast GROUP BY path: increments per-group counters as rows
+// arrive rather than materialising row slices, keeping O(1) state per group.
+func (e *Executor) executeGroupByAccum(stmt *parser.SelectStmt, rows []storage.Row, result *Result, expandedColumns []parser.SelectColumn, columnNames []string) (*Result, error) {
+	var aggCols []aggColInfo
+	for i, col := range expandedColumns {
+		if e.isAggregate(col.Expr) {
+			aggCols = append(aggCols, aggColInfo{i, col.Expr.(*parser.FunctionCall)})
+		}
+	}
+
+	states := make(map[string]*groupAccumState, 64)
+	var keyOrder []string
+
+	for _, row := range rows {
+		key := e.buildGroupKey(stmt.GroupBy, row)
+		state, exists := states[key]
+		if !exists {
+			accums := make([]*aggAccum, len(aggCols))
+			for j, ac := range aggCols {
+				a := &aggAccum{allInt: true}
+				if ac.fn.Distinct {
+					a.seen = make(map[interface{}]struct{})
+				}
+				accums[j] = a
+			}
+			state = &groupAccumState{firstRow: row, accums: accums}
+			states[key] = state
+			keyOrder = append(keyOrder, key)
+		}
+		for j, ac := range aggCols {
+			e.feedAggAccum(state.accums[j], ac.fn, row)
+		}
+	}
+
+	for _, key := range keyOrder {
+		state := states[key]
+		values := make([]interface{}, len(expandedColumns))
+		for i, col := range expandedColumns {
+			if e.isAggregate(col.Expr) {
+				for j, ac := range aggCols {
+					if ac.colIdx == i {
+						values[i] = finalizeAggAccum(state.accums[j], ac.fn)
+						break
+					}
+				}
+			} else {
+				val, _ := e.evalExpr(col.Expr, state.firstRow)
+				values[i] = val
+			}
+		}
+		result.AddRow(values...)
+	}
+
+	return e.finalizeGroupResult(stmt, result, expandedColumns, columnNames)
+}
+
+// feedAggAccum updates a running accumulator with one row.
+func (e *Executor) feedAggAccum(a *aggAccum, fn *parser.FunctionCall, row storage.Row) {
+	switch strings.ToUpper(fn.Name) {
+	case "COUNT":
+		if fn.Star {
+			a.count++
+			return
+		}
+		if len(fn.Args) == 0 {
+			return
+		}
+		val, _ := e.evalExpr(fn.Args[0], row)
+		if val == nil {
+			return
+		}
+		if fn.Distinct {
+			k := fmt.Sprintf("%v", val)
+			if _, exists := a.seen[k]; exists {
+				return
+			}
+			a.seen[k] = struct{}{}
+		}
+		a.count++
+
+	case "SUM":
+		if len(fn.Args) == 0 {
+			return
+		}
+		val, _ := e.evalExpr(fn.Args[0], row)
+		if val == nil {
+			return
+		}
+		if fn.Distinct {
+			k := fmt.Sprintf("%v", val)
+			if _, exists := a.seen[k]; exists {
+				return
+			}
+			a.seen[k] = struct{}{}
+		}
+		if isIntVal(val) {
+			a.sumI += toInt64(val)
+		} else {
+			a.allInt = false
+			a.sumF += toFloat(val)
+		}
+		a.hasVal = true
+
+	case "AVG":
+		if len(fn.Args) == 0 {
+			return
+		}
+		val, _ := e.evalExpr(fn.Args[0], row)
+		if val == nil {
+			return
+		}
+		a.sumF += toFloat(val)
+		a.count++
+		a.hasVal = true
+
+	case "MIN":
+		if len(fn.Args) == 0 {
+			return
+		}
+		val, _ := e.evalExpr(fn.Args[0], row)
+		if val != nil && (a.extreme == nil || compare(val, a.extreme) < 0) {
+			a.extreme = val
+		}
+
+	case "MAX":
+		if len(fn.Args) == 0 {
+			return
+		}
+		val, _ := e.evalExpr(fn.Args[0], row)
+		if val != nil && (a.extreme == nil || compare(val, a.extreme) > 0) {
+			a.extreme = val
+		}
+	}
+}
+
+// finalizeAggAccum computes the final aggregate value from a running accumulator.
+func finalizeAggAccum(a *aggAccum, fn *parser.FunctionCall) interface{} {
+	switch strings.ToUpper(fn.Name) {
+	case "COUNT":
+		return a.count
+	case "SUM":
+		if !a.hasVal {
+			return nil
+		}
+		if a.allInt {
+			return a.sumI
+		}
+		return a.sumF + float64(a.sumI)
+	case "AVG":
+		if !a.hasVal || a.count == 0 {
+			return nil
+		}
+		return a.sumF / float64(a.count)
+	case "MIN", "MAX":
+		return a.extreme
+	}
+	return nil
+}
+
+// finalizeGroupResult applies DISTINCT, ORDER BY, and LIMIT/OFFSET to a GROUP BY result.
+func (e *Executor) finalizeGroupResult(stmt *parser.SelectStmt, result *Result, expandedColumns []parser.SelectColumn, columnNames []string) (*Result, error) {
 	if stmt.Distinct {
 		result.Rows = e.applyDistinct(result.Rows)
 	}
-
-	// Apply ORDER BY
 	if len(stmt.OrderBy) > 0 {
 		e.sortResultRows(result, stmt.OrderBy, expandedColumns, columnNames)
 	}
-
-	// Apply LIMIT/OFFSET
 	if stmt.Offset != nil {
 		offset := e.evalIntExpr(stmt.Offset)
 		if offset < len(result.Rows) {
@@ -1442,12 +1714,15 @@ func (e *Executor) executeGroupBy(stmt *parser.SelectStmt, rows []storage.Row, s
 		}
 		result.RowCount = len(result.Rows)
 	}
-
 	return result, nil
 }
 
 // executeJoins recursively processes all JOIN clauses in a table reference.
 func (e *Executor) executeJoins(tableRef parser.TableRef, leftRows []storage.Row) ([]storage.Row, error) {
+	return e.executeJoinsWithMode(tableRef, leftRows, true)
+}
+
+func (e *Executor) executeJoinsWithMode(tableRef parser.TableRef, leftRows []storage.Row, qualifyLeft bool) ([]storage.Row, error) {
 	if tableRef.Join == nil || tableRef.Join.Table == nil {
 		return leftRows, nil
 	}
@@ -1477,69 +1752,100 @@ func (e *Executor) executeJoins(tableRef parser.TableRef, leftRows []storage.Row
 	if rightAlias == "" {
 		rightAlias = rightTable
 	}
+	leftAliasForMerge := leftAlias
+	if !qualifyLeft {
+		leftAliasForMerge = ""
+	}
+
+	// Build a synthetic TableRef so we can reuse extractEqualityJoinKeys.
+	syntheticLeft := parser.TableRef{Name: leftTableName, Alias: leftAlias}
+	syntheticJoin := &parser.JoinClause{
+		Type:      tableRef.Join.Type,
+		Table:     &parser.TableRef{Name: rightTable, Alias: rightAlias},
+		Condition: tableRef.Join.Condition,
+	}
+	leftKey, rightKey, canHash := extractEqualityJoinKeys(tableRef.Join.Condition, syntheticLeft, syntheticJoin)
 
 	switch tableRef.Join.Type {
 	case parser.JoinInner:
-		for _, left := range leftRows {
+		if canHash {
+			hashTable := make(map[string][]storage.Row, len(rightRows))
 			for _, right := range rightRows {
-				merged := e.mergeRows(left, right, leftAlias, rightAlias)
-				if tableRef.Join.Condition != nil {
-					match, _ := e.evalExpr(tableRef.Join.Condition, merged)
-					if toBool(match) {
+				k := joinKeyString(right, rightKey)
+				hashTable[k] = append(hashTable[k], right)
+			}
+			for _, left := range leftRows {
+				k := joinKeyString(left, leftKey)
+				for _, right := range hashTable[k] {
+					result = append(result, e.mergeRows(left, right, leftAliasForMerge, rightAlias))
+				}
+			}
+		} else {
+			for _, left := range leftRows {
+				for _, right := range rightRows {
+					merged := e.mergeRows(left, right, leftAliasForMerge, rightAlias)
+					if tableRef.Join.Condition != nil {
+						match, _ := e.evalExpr(tableRef.Join.Condition, merged)
+						if toBool(match) {
+							result = append(result, merged)
+						}
+					} else {
 						result = append(result, merged)
 					}
-				} else {
-					result = append(result, merged)
 				}
 			}
 		}
 
 	case parser.JoinLeft:
-		for _, left := range leftRows {
-			matched := false
+		if canHash {
+			hashTable := make(map[string][]storage.Row, len(rightRows))
 			for _, right := range rightRows {
-				merged := e.mergeRows(left, right, leftAlias, rightAlias)
-				if tableRef.Join.Condition != nil {
-					match, _ := e.evalExpr(tableRef.Join.Condition, merged)
-					if toBool(match) {
-						result = append(result, merged)
-						matched = true
+				k := joinKeyString(right, rightKey)
+				hashTable[k] = append(hashTable[k], right)
+			}
+			nullRight := makeNullRow(rightRows, rightTable, e)
+			for _, left := range leftRows {
+				k := joinKeyString(left, leftKey)
+				matches := hashTable[k]
+				if len(matches) == 0 {
+					result = append(result, e.mergeRows(left, nullRight, leftAliasForMerge, rightAlias))
+				} else {
+					for _, right := range matches {
+						result = append(result, e.mergeRows(left, right, leftAliasForMerge, rightAlias))
 					}
 				}
 			}
-			if !matched {
-				// Add left row with nulls for right table columns
-				// Create a null row for the right table
-				nullRight := make(storage.Row)
-				if len(rightRows) > 0 {
-					// Use the first right row as a template to get column names
-					for k := range rightRows[0] {
-						nullRight[k] = nil
-					}
-				} else {
-					// If right table is empty, get schema to determine columns
-					rightSchema, err := e.schema.GetSchema(rightTable)
-					if err == nil {
-						for _, col := range rightSchema.Columns {
-							nullRight[col.Name] = nil
+		} else {
+			for _, left := range leftRows {
+				matched := false
+				for _, right := range rightRows {
+					merged := e.mergeRows(left, right, leftAliasForMerge, rightAlias)
+					if tableRef.Join.Condition != nil {
+						match, _ := e.evalExpr(tableRef.Join.Condition, merged)
+						if toBool(match) {
+							result = append(result, merged)
+							matched = true
 						}
 					}
 				}
-				result = append(result, e.mergeRows(left, nullRight, leftAlias, rightAlias))
+				if !matched {
+					nullRight := makeNullRow(rightRows, rightTable, e)
+					result = append(result, e.mergeRows(left, nullRight, leftAliasForMerge, rightAlias))
+				}
 			}
 		}
 
 	case parser.JoinCross:
 		for _, left := range leftRows {
 			for _, right := range rightRows {
-				result = append(result, e.mergeRows(left, right, leftAlias, rightAlias))
+				result = append(result, e.mergeRows(left, right, leftAliasForMerge, rightAlias))
 			}
 		}
 	}
 
 	// Recursively process any additional joins
 	if rightTableRef.Join != nil {
-		return e.executeJoins(*rightTableRef, result)
+		return e.executeJoinsWithMode(*rightTableRef, result, false)
 	}
 
 	return result, nil
@@ -1562,52 +1868,73 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 
 	switch join.Type {
 	case parser.JoinInner:
-		for _, left := range leftRows {
+		leftKey, rightKey, canHash := extractEqualityJoinKeys(join.Condition, tableRef, join)
+		if canHash {
+			// Hash join: build phase on right, probe phase on left — O(N+M) vs O(N*M)
+			hashTable := make(map[string][]storage.Row, len(rightRows))
 			for _, right := range rightRows {
-				merged := e.mergeRows(left, right, tableRef.Alias, join.Table.Alias)
-				if join.Condition != nil {
-					match, _ := e.evalExpr(join.Condition, merged)
-					if toBool(match) {
+				k := joinKeyString(right, rightKey)
+				hashTable[k] = append(hashTable[k], right)
+			}
+			for _, left := range leftRows {
+				k := joinKeyString(left, leftKey)
+				for _, right := range hashTable[k] {
+					result = append(result, e.mergeRows(left, right, tableRef.Alias, join.Table.Alias))
+				}
+			}
+		} else {
+			for _, left := range leftRows {
+				for _, right := range rightRows {
+					merged := e.mergeRows(left, right, tableRef.Alias, join.Table.Alias)
+					if join.Condition != nil {
+						match, _ := e.evalExpr(join.Condition, merged)
+						if toBool(match) {
+							result = append(result, merged)
+						}
+					} else {
 						result = append(result, merged)
 					}
-				} else {
-					result = append(result, merged)
 				}
 			}
 		}
 
 	case parser.JoinLeft:
-		for _, left := range leftRows {
-			matched := false
+		leftKey, rightKey, canHash := extractEqualityJoinKeys(join.Condition, tableRef, join)
+		if canHash {
+			hashTable := make(map[string][]storage.Row, len(rightRows))
 			for _, right := range rightRows {
-				merged := e.mergeRows(left, right, tableRef.Alias, join.Table.Alias)
-				if join.Condition != nil {
-					match, _ := e.evalExpr(join.Condition, merged)
-					if toBool(match) {
-						result = append(result, merged)
-						matched = true
+				k := joinKeyString(right, rightKey)
+				hashTable[k] = append(hashTable[k], right)
+			}
+			nullRight := makeNullRow(rightRows, rightTable, e)
+			for _, left := range leftRows {
+				k := joinKeyString(left, leftKey)
+				matches := hashTable[k]
+				if len(matches) == 0 {
+					result = append(result, e.mergeRows(left, nullRight, tableRef.Alias, join.Table.Alias))
+				} else {
+					for _, right := range matches {
+						result = append(result, e.mergeRows(left, right, tableRef.Alias, join.Table.Alias))
 					}
 				}
 			}
-			if !matched {
-				// Add left row with nulls for right table columns
-				// Create a null row for the right table
-				nullRight := make(storage.Row)
-				if len(rightRows) > 0 {
-					// Use the first right row as a template to get column names
-					for k := range rightRows[0] {
-						nullRight[k] = nil
-					}
-				} else {
-					// If right table is empty, get schema to determine columns
-					rightSchema, err := e.schema.GetSchema(rightTable)
-					if err == nil {
-						for _, col := range rightSchema.Columns {
-							nullRight[col.Name] = nil
+		} else {
+			for _, left := range leftRows {
+				matched := false
+				for _, right := range rightRows {
+					merged := e.mergeRows(left, right, tableRef.Alias, join.Table.Alias)
+					if join.Condition != nil {
+						match, _ := e.evalExpr(join.Condition, merged)
+						if toBool(match) {
+							result = append(result, merged)
+							matched = true
 						}
 					}
 				}
-				result = append(result, e.mergeRows(left, nullRight, tableRef.Alias, join.Table.Alias))
+				if !matched {
+					nullRight := makeNullRow(rightRows, rightTable, e)
+					result = append(result, e.mergeRows(left, nullRight, tableRef.Alias, join.Table.Alias))
+				}
 			}
 		}
 
@@ -1620,6 +1947,85 @@ func (e *Executor) executeJoin(tableRef parser.TableRef, leftRows []storage.Row)
 	}
 
 	return result, nil
+}
+
+// extractEqualityJoinKeys checks if a JOIN condition is a simple col = col equality
+// and returns the key names to probe in left rows and build from right rows.
+func extractEqualityJoinKeys(condition parser.Expr, leftRef parser.TableRef, join *parser.JoinClause) (leftKey, rightKey string, ok bool) {
+	if condition == nil {
+		return "", "", false
+	}
+	bin, isBin := condition.(*parser.BinaryExpr)
+	if !isBin || bin.Op != lexer.TokenEq {
+		return "", "", false
+	}
+	lRef, leftIsCol := bin.Left.(*parser.ColumnRef)
+	rRef, rightIsCol := bin.Right.(*parser.ColumnRef)
+	if !leftIsCol || !rightIsCol {
+		return "", "", false
+	}
+
+	leftAlias := leftRef.Alias
+	leftName := leftRef.Name
+	rightAlias := join.Table.Alias
+	rightName := join.Table.Name
+
+	leftJoinKey := func(r *parser.ColumnRef) (string, bool) {
+		if r.Table == "" || r.Table == leftAlias || r.Table == leftName {
+			return r.Column, true
+		}
+		// In a chained explicit JOIN, the left row already contains every table
+		// joined so far. Preserve qualified references such as "o.id" so joins
+		// against earlier tables can still use the hash path.
+		if r.Table != rightAlias && r.Table != rightName {
+			return r.Table + "." + r.Column, true
+		}
+		return "", false
+	}
+	rightJoinKey := func(r *parser.ColumnRef) (string, bool) {
+		if r.Table == "" || r.Table == rightAlias || r.Table == rightName {
+			return r.Column, true
+		}
+		return "", false
+	}
+
+	if lk, leftOK := leftJoinKey(lRef); leftOK {
+		if rk, rightOK := rightJoinKey(rRef); rightOK {
+			return lk, rk, true
+		}
+	}
+	if lk, leftOK := leftJoinKey(rRef); leftOK {
+		if rk, rightOK := rightJoinKey(lRef); rightOK {
+			return lk, rk, true
+		}
+	}
+	return "", "", false
+}
+
+// joinKeyString returns a string representation of a row's join key for hashing.
+func joinKeyString(row storage.Row, col string) string {
+	if v, ok := row[col]; ok {
+		return fmt.Sprintf("%v", v)
+	}
+	return "\x00"
+}
+
+// makeNullRow builds a null-valued row based on the right table's rows or schema.
+func makeNullRow(rightRows []storage.Row, rightTable string, e *Executor) storage.Row {
+	nullRight := make(storage.Row)
+	if len(rightRows) > 0 {
+		for k := range rightRows[0] {
+			nullRight[k] = nil
+		}
+	} else {
+		rightSchema, err := e.schema.GetSchema(rightTable)
+		if err == nil {
+			for _, col := range rightSchema.Columns {
+				nullRight[col.Name] = nil
+			}
+		}
+	}
+	return nullRight
 }
 
 // mergeRows merges two rows with optional table aliases.
@@ -3708,6 +4114,12 @@ func (e *Executor) evalCastExpr(expr *parser.CastExpr, row storage.Row) (interfa
 // - NULL if the subquery returns no rows
 // - Error if the subquery returns more than one row (for strict SQL compliance)
 func (e *Executor) evalSubqueryExpr(expr *parser.SubqueryExpr, row storage.Row) (interface{}, error) {
+	if row != nil && e.correlatedAggCache != nil {
+		if val, ok, err := e.evalDecorrelatedAggSubquery(expr.Query, row); ok || err != nil {
+			return val, err
+		}
+	}
+
 	// Save and set outer row context for correlated subqueries
 	savedOuter := e.outerRow
 	e.outerRow = row
@@ -3737,6 +4149,149 @@ func (e *Executor) evalSubqueryExpr(expr *parser.SubqueryExpr, row storage.Row) 
 	}
 
 	return nil, nil
+}
+
+func (e *Executor) evalDecorrelatedAggSubquery(query *parser.SelectStmt, outerRow storage.Row) (interface{}, bool, error) {
+	spec, ok := e.correlatedAggSpec(query)
+	if !ok {
+		return nil, false, nil
+	}
+
+	outerVal, err := e.evalExpr(spec.outerKey, outerRow)
+	if err != nil {
+		return nil, true, err
+	}
+	cache, exists := e.correlatedAggCache[query]
+	if !exists {
+		cache, err = e.buildCorrelatedAggCache(query, spec)
+		if err != nil {
+			return nil, true, err
+		}
+		e.correlatedAggCache[query] = cache
+	}
+	if outerVal == nil {
+		return cache.defaultValue, true, nil
+	}
+	if val, exists := cache.values[fmt.Sprintf("%v", outerVal)]; exists {
+		return val, true, nil
+	}
+	return cache.defaultValue, true, nil
+}
+
+func (e *Executor) correlatedAggSpec(query *parser.SelectStmt) (correlatedAggSpec, bool) {
+	if query == nil ||
+		query.Compound != nil ||
+		len(query.Columns) != 1 ||
+		len(query.From) == 0 ||
+		query.Where == nil ||
+		len(query.GroupBy) > 0 ||
+		query.Having != nil ||
+		query.Limit != nil ||
+		query.Offset != nil {
+		return correlatedAggSpec{}, false
+	}
+	if query.Columns[0].Star {
+		return correlatedAggSpec{}, false
+	}
+	agg, ok := query.Columns[0].Expr.(*parser.FunctionCall)
+	if !ok {
+		return correlatedAggSpec{}, false
+	}
+	switch strings.ToUpper(agg.Name) {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+	default:
+		return correlatedAggSpec{}, false
+	}
+
+	innerAliases := collectFromAliases(query.From)
+	bin, ok := query.Where.(*parser.BinaryExpr)
+	if !ok || bin.Op != lexer.TokenEq {
+		return correlatedAggSpec{}, false
+	}
+	leftRef, leftIsRef := bin.Left.(*parser.ColumnRef)
+	rightRef, rightIsRef := bin.Right.(*parser.ColumnRef)
+	if !leftIsRef || !rightIsRef {
+		return correlatedAggSpec{}, false
+	}
+
+	leftInner := refBelongsToAliases(leftRef, innerAliases)
+	rightInner := refBelongsToAliases(rightRef, innerAliases)
+	if leftInner == rightInner {
+		return correlatedAggSpec{}, false
+	}
+	if leftInner {
+		return correlatedAggSpec{innerKey: leftRef, outerKey: rightRef, aggExpr: agg}, true
+	}
+	return correlatedAggSpec{innerKey: rightRef, outerKey: leftRef, aggExpr: agg}, true
+}
+
+func (e *Executor) buildCorrelatedAggCache(query *parser.SelectStmt, spec correlatedAggSpec) (*correlatedAggCache, error) {
+	grouped := *query
+	grouped.Where = nil
+	grouped.GroupBy = []parser.Expr{spec.innerKey}
+	grouped.Having = nil
+	grouped.OrderBy = nil
+	grouped.Limit = nil
+	grouped.Offset = nil
+	grouped.Columns = []parser.SelectColumn{
+		{Expr: spec.innerKey, Alias: "__corr_key"},
+		{Expr: spec.aggExpr, Alias: "__corr_value"},
+	}
+
+	savedOuter := e.outerRow
+	e.outerRow = nil
+	result, err := e.executeSelect(&grouped)
+	e.outerRow = savedOuter
+	if err != nil {
+		return nil, fmt.Errorf("decorrelated aggregate subquery error: %w", err)
+	}
+
+	cache := &correlatedAggCache{
+		values:       make(map[string]interface{}, len(result.Rows)),
+		defaultValue: correlatedAggDefault(spec.aggExpr),
+	}
+	for _, row := range result.Rows {
+		if len(row) < 2 || row[0] == nil {
+			continue
+		}
+		cache.values[fmt.Sprintf("%v", row[0])] = row[1]
+	}
+	return cache, nil
+}
+
+func correlatedAggDefault(expr parser.Expr) interface{} {
+	if fn, ok := expr.(*parser.FunctionCall); ok && strings.EqualFold(fn.Name, "COUNT") {
+		return int64(0)
+	}
+	return nil
+}
+
+func collectFromAliases(from []parser.TableRef) map[string]struct{} {
+	aliases := make(map[string]struct{})
+	var addRef func(parser.TableRef)
+	addRef = func(ref parser.TableRef) {
+		if ref.Name != "" {
+			aliases[strings.ToLower(ref.Name)] = struct{}{}
+		}
+		if ref.Alias != "" {
+			aliases[strings.ToLower(ref.Alias)] = struct{}{}
+		}
+		if ref.Join != nil && ref.Join.Table != nil {
+			addRef(*ref.Join.Table)
+		}
+	}
+	for _, ref := range from {
+		addRef(ref)
+	}
+	return aliases
+}
+
+func refBelongsToAliases(ref *parser.ColumnRef, aliases map[string]struct{}) bool {
+	if ref == nil || ref.Table == "" {
+		return false
+	}
+	_, ok := aliases[strings.ToLower(ref.Table)]
+	return ok
 }
 
 // evalExistsExpr evaluates an EXISTS expression.

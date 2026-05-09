@@ -19,22 +19,37 @@ type TableManager struct {
 
 	cacheMu  sync.RWMutex
 	rowCache map[string][]Row // table name → all rows (nil means not loaded)
+	rowIDMap map[string]map[int64]Row
+
+	indexCache map[string]map[string][]int64 // index name → indexed value → rowids
+	indexTable map[string]string             // index name → table name
 }
 
 // NewTableManager creates a new table manager.
 func NewTableManager(pool *KVPool, schema *SchemaManager, database string) *TableManager {
 	return &TableManager{
-		pool:     pool,
-		schema:   schema,
-		database: database,
-		rowCache: make(map[string][]Row),
+		pool:       pool,
+		schema:     schema,
+		database:   database,
+		rowCache:   make(map[string][]Row),
+		rowIDMap:   make(map[string]map[int64]Row),
+		indexCache: make(map[string]map[string][]int64),
+		indexTable: make(map[string]string),
 	}
 }
 
 // invalidateCache removes a table's rows from the in-memory cache.
 func (m *TableManager) invalidateCache(table string) {
 	m.cacheMu.Lock()
-	delete(m.rowCache, strings.ToLower(table))
+	key := strings.ToLower(table)
+	delete(m.rowCache, key)
+	delete(m.rowIDMap, key)
+	for indexName, tableName := range m.indexTable {
+		if tableName == key {
+			delete(m.indexCache, indexName)
+			delete(m.indexTable, indexName)
+		}
+	}
 	m.cacheMu.Unlock()
 }
 
@@ -182,7 +197,7 @@ func (m *TableManager) Insert(table string, row Row) error {
 		return err
 	}
 
-	// Update indexes
+	// Update in-memory indexes only. Durable index entries are derived from rows.
 	m.updateIndexesForRow(table, normalizedRow, true)
 
 	m.invalidateCache(table)
@@ -288,93 +303,33 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 		}
 	}
 
-	// Build index entries grouped by key (to avoid read-merge races).
-	indexes, _ := m.schema.ListTableIndexes(table)
-	if len(indexes) > 0 {
-		// For each index, gather {indexKey → []rowid} from the new rows.
-		type indexEntry struct {
-			key    string
-			rowids []int64
-		}
-		var entries []indexEntry
-
-		for _, idx := range indexes {
-			cols := make([]string, len(idx.Columns))
-			for i, c := range idx.Columns {
-				cols[i] = c.Name
-			}
-			byKey := make(map[string][]int64)
-			for _, nr := range normalized {
-				colVal := m.buildIndexValue(nr, cols)
-				ikey := m.indexEntryKey(idx.Name, colVal)
-				var rowid int64
-				switch v := nr["_rowid_"].(type) {
-				case int64:
-					rowid = v
-				case float64:
-					rowid = int64(v)
-				}
-				byKey[ikey] = append(byKey[ikey], rowid)
-			}
-			for k, rs := range byKey {
-				entries = append(entries, indexEntry{k, rs})
-			}
-		}
-
-		// Write index entries concurrently; each key is handled by exactly
-		// one goroutine so there's no merge race.
-		ieErrs := make([]error, len(entries))
-		var iwg sync.WaitGroup
-		for i, e := range entries {
-			iwg.Add(1)
-			i, e := i, e
-			go func() {
-				defer iwg.Done()
-				// Merge with any existing rowids for this key.
-				var existing []int64
-				m.pool.WithClient(func(c *KVClient) error {
-					data, err := c.Read(e.key)
-					if err == nil {
-						json.Unmarshal([]byte(data), &existing)
-					}
-					return nil
-				})
-				merged := append(existing, e.rowids...)
-				data, _ := json.Marshal(merged)
-				ieErrs[i] = m.pool.WithClient(func(c *KVClient) error {
-					return c.Write(e.key, string(data))
-				})
-			}()
-		}
-		iwg.Wait()
-		for _, e := range ieErrs {
-			if e != nil {
-				return 0, e
-			}
-		}
-	}
-
 	m.invalidateCache(table)
 	return len(normalized), nil
 }
 
-// updateIndexesForRow adds or removes index entries for a row.
+// updateIndexesForRow adds or removes entries from already-built in-memory
+// indexes. Index entries are rebuildable from durable row data, so this method
+// intentionally does not write idx:* keys to KV.
 func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) {
 	indexes, err := m.schema.ListTableIndexes(table)
 	if err != nil || len(indexes) == 0 {
 		return
 	}
 
-	rowid, ok := row["_rowid_"].(float64)
+	rowid, ok := rowIDFromRow(row)
 	if !ok {
-		if rid, ok := row["_rowid_"].(int64); ok {
-			rowid = float64(rid)
-		} else {
-			return
-		}
+		return
 	}
 
 	for _, idx := range indexes {
+		indexName := strings.ToLower(idx.Name)
+		m.cacheMu.RLock()
+		_, initialized := m.indexCache[indexName]
+		m.cacheMu.RUnlock()
+		if !initialized {
+			continue
+		}
+
 		columns := make([]string, len(idx.Columns))
 		for i, col := range idx.Columns {
 			columns[i] = col.Name
@@ -382,9 +337,9 @@ func (m *TableManager) updateIndexesForRow(table string, row Row, add bool) {
 		colValue := m.buildIndexValue(row, columns)
 
 		if add {
-			m.AddIndexEntry(idx.Name, colValue, int64(rowid))
+			m.AddIndexEntry(idx.Name, colValue, rowid)
 		} else {
-			m.RemoveIndexEntry(idx.Name, colValue, int64(rowid))
+			m.RemoveIndexEntry(idx.Name, colValue, rowid)
 		}
 	}
 }
@@ -414,16 +369,21 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 		}
 
 		loaded := make([]Row, 0, len(values))
+		byRowID := make(map[int64]Row, len(values))
 		for _, data := range values {
 			var row Row
 			if err := json.Unmarshal([]byte(data), &row); err != nil {
 				continue
 			}
 			loaded = append(loaded, row)
+			if rowid, ok := valueAsInt64(row["_rowid_"]); ok {
+				byRowID[rowid] = row
+			}
 		}
 
 		m.cacheMu.Lock()
 		m.rowCache[key] = loaded
+		m.rowIDMap[key] = byRowID
 		m.cacheMu.Unlock()
 
 		cached = loaded
@@ -682,24 +642,7 @@ func IsRowIDColumn(name string) bool {
 
 // indexEntryKey returns the key for an index entry.
 func (m *TableManager) indexEntryKey(indexName string, colValue interface{}) string {
-	// Format the value without scientific notation
-	var valueStr string
-	switch v := colValue.(type) {
-	case float64:
-		// Check if it's actually an integer value
-		if v == float64(int64(v)) {
-			valueStr = fmt.Sprintf("%d", int64(v))
-		} else {
-			valueStr = fmt.Sprintf("%f", v)
-		}
-	case int64:
-		valueStr = fmt.Sprintf("%d", v)
-	case int:
-		valueStr = fmt.Sprintf("%d", v)
-	default:
-		valueStr = fmt.Sprintf("%v", v)
-	}
-	return fmt.Sprintf("%s:idx:%s:%s", m.database, strings.ToLower(indexName), valueStr)
+	return fmt.Sprintf("%s:idx:%s:%s", m.database, strings.ToLower(indexName), formatIndexValue(colValue))
 }
 
 // indexPrefix returns the prefix for all entries of an index.
@@ -707,57 +650,110 @@ func (m *TableManager) indexPrefix(indexName string) string {
 	return fmt.Sprintf("%s:idx:%s:", m.database, strings.ToLower(indexName))
 }
 
-// AddIndexEntry adds a rowid to an index entry.
-func (m *TableManager) AddIndexEntry(indexName string, colValue interface{}, rowid int64) error {
-	key := m.indexEntryKey(indexName, colValue)
-
-	// Read existing rowids
-	var rowids []int64
-	err := m.pool.WithClient(func(c *KVClient) error {
-		data, err := c.Read(key)
-		if err == nil && data != "" {
-			json.Unmarshal([]byte(data), &rowids)
+func formatIndexValue(value interface{}) string {
+	switch v := value.(type) {
+	case float64:
+		if v == float64(int64(v)) {
+			return fmt.Sprintf("%d", int64(v))
 		}
-		return nil // Ignore not found errors
-	})
+		return fmt.Sprintf("%f", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
+	case int:
+		return fmt.Sprintf("%d", v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func rowIDFromRow(row Row) (int64, bool) {
+	switch v := row["_rowid_"].(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	default:
+		return 0, false
+	}
+}
+
+func (m *TableManager) ensureIndex(index *Index) error {
+	indexKey := strings.ToLower(index.Name)
+	m.cacheMu.RLock()
+	_, initialized := m.indexCache[indexKey]
+	m.cacheMu.RUnlock()
+	if initialized {
+		return nil
+	}
+
+	columns := make([]string, len(index.Columns))
+	for i, col := range index.Columns {
+		columns[i] = col.Name
+	}
+
+	rows, err := m.Select(index.Table, nil)
 	if err != nil {
 		return err
 	}
 
-	// Add new rowid if not already present
-	for _, r := range rowids {
-		if r == rowid {
-			return nil // Already exists
+	values := make(map[string][]int64)
+	for _, row := range rows {
+		rowid, ok := rowIDFromRow(row)
+		if !ok {
+			continue
 		}
+		colValue := m.buildIndexValue(row, columns)
+		valueKey := formatIndexValue(colValue)
+		values[valueKey] = append(values[valueKey], rowid)
 	}
-	rowids = append(rowids, rowid)
 
-	// Write back
-	data, _ := json.Marshal(rowids)
-	return m.pool.WithClient(func(c *KVClient) error {
-		return c.Write(key, string(data))
-	})
+	m.cacheMu.Lock()
+	if _, initialized := m.indexCache[indexKey]; !initialized {
+		m.indexCache[indexKey] = values
+		m.indexTable[indexKey] = strings.ToLower(index.Table)
+	}
+	m.cacheMu.Unlock()
+
+	return nil
 }
 
-// RemoveIndexEntry removes a rowid from an index entry.
-func (m *TableManager) RemoveIndexEntry(indexName string, colValue interface{}, rowid int64) error {
-	key := m.indexEntryKey(indexName, colValue)
+// AddIndexEntry adds a rowid to an in-memory index entry.
+func (m *TableManager) AddIndexEntry(indexName string, colValue interface{}, rowid int64) error {
+	indexKey := strings.ToLower(indexName)
+	valueKey := formatIndexValue(colValue)
 
-	// Read existing rowids
-	var rowids []int64
-	err := m.pool.WithClient(func(c *KVClient) error {
-		data, err := c.Read(key)
-		if err != nil {
-			return err
-		}
-		json.Unmarshal([]byte(data), &rowids)
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+
+	values, ok := m.indexCache[indexKey]
+	if !ok {
 		return nil
-	})
-	if err != nil {
-		return nil // Entry doesn't exist
 	}
+	rowids := values[valueKey]
+	for _, r := range rowids {
+		if r == rowid {
+			return nil
+		}
+	}
+	values[valueKey] = append(rowids, rowid)
+	return nil
+}
 
-	// Remove rowid
+// RemoveIndexEntry removes a rowid from an in-memory index entry.
+func (m *TableManager) RemoveIndexEntry(indexName string, colValue interface{}, rowid int64) error {
+	indexKey := strings.ToLower(indexName)
+	valueKey := formatIndexValue(colValue)
+
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+
+	values, ok := m.indexCache[indexKey]
+	if !ok {
+		return nil
+	}
+	rowids := values[valueKey]
 	newRowids := make([]int64, 0, len(rowids))
 	for _, r := range rowids {
 		if r != rowid {
@@ -766,34 +762,30 @@ func (m *TableManager) RemoveIndexEntry(indexName string, colValue interface{}, 
 	}
 
 	if len(newRowids) == 0 {
-		// Delete the entry entirely
-		return m.pool.WithClient(func(c *KVClient) error {
-			return c.Delete(key)
-		})
+		delete(values, valueKey)
+		return nil
 	}
 
-	// Write back
-	data, _ := json.Marshal(newRowids)
-	return m.pool.WithClient(func(c *KVClient) error {
-		return c.Write(key, string(data))
-	})
+	values[valueKey] = newRowids
+	return nil
 }
 
 // LookupIndex returns rowids matching a column value using the index.
 func (m *TableManager) LookupIndex(indexName string, colValue interface{}) ([]int64, error) {
-	key := m.indexEntryKey(indexName, colValue)
-
-	var rowids []int64
-	err := m.pool.WithClient(func(c *KVClient) error {
-		data, err := c.Read(key)
-		if err != nil {
-			return err
-		}
-		return json.Unmarshal([]byte(data), &rowids)
-	})
+	index, err := m.schema.GetIndex(indexName)
 	if err != nil {
-		return nil, nil // Return empty if not found
+		return nil, err
 	}
+	if err := m.ensureIndex(index); err != nil {
+		return nil, err
+	}
+
+	indexKey := strings.ToLower(indexName)
+	valueKey := formatIndexValue(colValue)
+
+	m.cacheMu.RLock()
+	rowids := append([]int64(nil), m.indexCache[indexKey][valueKey]...)
+	m.cacheMu.RUnlock()
 
 	return rowids, nil
 }
@@ -818,23 +810,32 @@ func (m *TableManager) ClearIndex(indexName, tableName string, columns []string)
 
 // BuildIndex builds index entries for all existing rows in a table.
 func (m *TableManager) BuildIndex(indexName, tableName string, columns []string) error {
+	index, err := m.schema.GetIndex(indexName)
+	if err == nil {
+		return m.ensureIndex(index)
+	}
+
 	rows, err := m.Select(tableName, nil)
 	if err != nil {
 		return err
 	}
 
+	values := make(map[string][]int64)
 	for _, row := range rows {
-		rowid, ok := row["_rowid_"].(float64)
+		rowid, ok := rowIDFromRow(row)
 		if !ok {
 			continue
 		}
 
-		// Build composite key value for multi-column indexes
 		colValue := m.buildIndexValue(row, columns)
-		if err := m.AddIndexEntry(indexName, colValue, int64(rowid)); err != nil {
-			return err
-		}
+		values[formatIndexValue(colValue)] = append(values[formatIndexValue(colValue)], rowid)
 	}
+
+	indexKey := strings.ToLower(indexName)
+	m.cacheMu.Lock()
+	m.indexCache[indexKey] = values
+	m.indexTable[indexKey] = strings.ToLower(tableName)
+	m.cacheMu.Unlock()
 
 	return nil
 }
@@ -883,23 +884,30 @@ func (m *TableManager) SelectByIndex(table, indexName string, colValue interface
 	}
 
 	// Build a set of target rowids for O(1) lookup.
-	rowidSet := make(map[int64]struct{}, len(rowids))
-	for _, rid := range rowids {
-		rowidSet[rid] = struct{}{}
-	}
-	allRows, _ := m.Select(table, func(r Row) bool {
-		switch v := r["_rowid_"].(type) {
-		case float64:
-			_, ok := rowidSet[int64(v)]
-			return ok
-		case int64:
-			_, ok := rowidSet[v]
-			return ok
+	key := strings.ToLower(table)
+	m.cacheMu.RLock()
+	byRowID, ok := m.rowIDMap[key]
+	m.cacheMu.RUnlock()
+	if !ok {
+		if _, err := m.Select(table, nil); err != nil {
+			return nil, err
 		}
-		return false
-	})
+		m.cacheMu.RLock()
+		byRowID = m.rowIDMap[key]
+		m.cacheMu.RUnlock()
+	}
 
-	rows := allRows
+	rows := make([]Row, 0, len(rowids))
+	seen := make(map[int64]struct{}, len(rowids))
+	for _, rid := range rowids {
+		if _, duplicate := seen[rid]; duplicate {
+			continue
+		}
+		seen[rid] = struct{}{}
+		if row, ok := byRowID[rid]; ok {
+			rows = append(rows, row)
+		}
+	}
 
 	return rows, nil
 }

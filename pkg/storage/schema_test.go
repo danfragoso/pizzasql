@@ -76,6 +76,14 @@ func (s *testKVServer) writeCount(prefix string) int {
 	return count
 }
 
+func (s *testKVServer) hasKey(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, ok := s.data[key]
+	return ok
+}
+
 func (s *testKVServer) handle(conn net.Conn) {
 	defer conn.Close()
 
@@ -168,7 +176,160 @@ func TestInsertDoesNotRewriteSchemaForRowIDUpdates(t *testing.T) {
 	if got := kv.writeCount(":_schema:"); got != initialSchemaWrites {
 		t.Fatalf("expected inserts not to rewrite schema, got %d schema writes", got)
 	}
-	if got := kv.writeCount(":_sys:rowid:"); got != 3 {
-		t.Fatalf("expected rowid counter writes for inserts, got %d", got)
+	if got := kv.writeCount(":_sys:rowid:"); got != 0 {
+		t.Fatalf("expected no rowid counter writes for inserts, got %d", got)
+	}
+}
+
+func TestRowIDIsDerivedFromRowsAfterRestart(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+
+	pool := newTestKVPool(kv, 2, 5*time.Second)
+	defer pool.Close()
+
+	schemas := NewSchemaManager(pool, "testdb")
+	tables := NewTableManager(pool, schemas, "testdb")
+
+	err := schemas.CreateTable(&Schema{
+		Name: "events",
+		Columns: []Column{
+			{Name: "name", Type: "TEXT", Nullable: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	for i := 1; i <= 2; i++ {
+		err := tables.Insert("events", Row{"name": fmt.Sprintf("event-%d", i)})
+		if err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	// Simulate a process restart: new managers have empty in-memory ROWID state
+	// but the same durable KV rows.
+	restartedSchemas := NewSchemaManager(pool, "testdb")
+	restartedTables := NewTableManager(pool, restartedSchemas, "testdb")
+	if err := restartedTables.Insert("events", Row{"name": "event-3"}); err != nil {
+		t.Fatalf("insert after restart: %v", err)
+	}
+
+	if !kv.hasKey("testdb:_data:events:3") {
+		t.Fatalf("expected restart insert to continue at rowid 3")
+	}
+	if got := kv.writeCount(":_sys:rowid:"); got != 0 {
+		t.Fatalf("expected no rowid counter writes, got %d", got)
+	}
+}
+
+func TestInsertDoesNotWriteDurableIndexEntries(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+
+	pool := newTestKVPool(kv, 2, 5*time.Second)
+	defer pool.Close()
+
+	schemas := NewSchemaManager(pool, "testdb")
+	tables := NewTableManager(pool, schemas, "testdb")
+
+	err := schemas.CreateTable(&Schema{
+		Name: "users",
+		Columns: []Column{
+			{Name: "id", Type: "INTEGER", Nullable: false, PrimaryKey: true},
+			{Name: "status", Type: "TEXT", Nullable: false},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	err = schemas.CreateIndex(&Index{
+		Name:  "idx_users_status",
+		Table: "users",
+		Columns: []IndexColumn{
+			{Name: "status"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+
+	for i := int64(1); i <= 3; i++ {
+		status := "active"
+		if i == 2 {
+			status = "inactive"
+		}
+		err := tables.Insert("users", Row{"id": i, "status": status})
+		if err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	if got := kv.writeCount(":idx:"); got != 0 {
+		t.Fatalf("expected no durable index entry writes, got %d", got)
+	}
+
+	rows, err := tables.SelectByIndex("users", "idx_users_status", "active")
+	if err != nil {
+		t.Fatalf("select by index: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 active rows from derived index, got %d", len(rows))
+	}
+}
+
+func TestIndexIsDerivedFromRowsAfterRestart(t *testing.T) {
+	kv := newTestKVServer(t)
+	defer kv.close()
+
+	pool := newTestKVPool(kv, 2, 5*time.Second)
+	defer pool.Close()
+
+	schemas := NewSchemaManager(pool, "testdb")
+	tables := NewTableManager(pool, schemas, "testdb")
+
+	err := schemas.CreateTable(&Schema{
+		Name: "users",
+		Columns: []Column{
+			{Name: "id", Type: "INTEGER", Nullable: false, PrimaryKey: true},
+			{Name: "status", Type: "TEXT", Nullable: false},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	err = schemas.CreateIndex(&Index{
+		Name:  "idx_users_status",
+		Table: "users",
+		Columns: []IndexColumn{
+			{Name: "status"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create index: %v", err)
+	}
+	for i := int64(1); i <= 3; i++ {
+		status := "active"
+		if i == 3 {
+			status = "inactive"
+		}
+		if err := tables.Insert("users", Row{"id": i, "status": status}); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	restartedSchemas := NewSchemaManager(pool, "testdb")
+	restartedTables := NewTableManager(pool, restartedSchemas, "testdb")
+
+	rows, err := restartedTables.SelectByIndex("users", "idx_users_status", "active")
+	if err != nil {
+		t.Fatalf("select by index after restart: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 active rows from restart-derived index, got %d", len(rows))
+	}
+	if got := kv.writeCount(":idx:"); got != 0 {
+		t.Fatalf("expected no durable index entry writes, got %d", got)
 	}
 }

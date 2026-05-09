@@ -800,6 +800,115 @@ func TestEvalSubqueryExpr(t *testing.T) {
 	execSQL(exec, "DROP TABLE IF EXISTS categories")
 }
 
+func TestChainedJoinCanHashAgainstEarlierTable(t *testing.T) {
+	pool, err := storage.NewKVPool("localhost:8085", 5, 5*time.Second)
+	if err != nil {
+		t.Skipf("PizzaKV not available: %v", err)
+	}
+	defer pool.Close()
+
+	schema := storage.NewSchemaManager(pool, "test_chained_join_hash_db")
+	table := storage.NewTableManager(pool, schema, "test_chained_join_hash_db")
+	exec := New(schema, table)
+
+	for _, sql := range []string{
+		"DROP TABLE IF EXISTS order_items",
+		"DROP TABLE IF EXISTS orders",
+		"DROP TABLE IF EXISTS addresses",
+		"CREATE TABLE orders (id INTEGER PRIMARY KEY, shipping_address_id INTEGER)",
+		"CREATE TABLE addresses (id INTEGER PRIMARY KEY, state TEXT)",
+		"CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER, line_total REAL)",
+		"INSERT INTO addresses VALUES (1, 'CA')",
+		"INSERT INTO addresses VALUES (2, 'NY')",
+		"INSERT INTO orders VALUES (10, 1)",
+		"INSERT INTO orders VALUES (11, 2)",
+		"INSERT INTO order_items VALUES (100, 10, 25.0)",
+		"INSERT INTO order_items VALUES (101, 10, 30.0)",
+		"INSERT INTO order_items VALUES (102, 11, 10.0)",
+	} {
+		if _, err := execSQL(exec, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	defer execSQL(exec, "DROP TABLE IF EXISTS order_items")
+	defer execSQL(exec, "DROP TABLE IF EXISTS orders")
+	defer execSQL(exec, "DROP TABLE IF EXISTS addresses")
+
+	result, err := execSQL(exec, `
+		SELECT a.state, COUNT(oi.id) AS lines, SUM(oi.line_total) AS revenue
+		FROM orders o
+		JOIN addresses a ON o.shipping_address_id = a.id
+		JOIN order_items oi ON oi.order_id = o.id
+		GROUP BY a.state
+		ORDER BY a.state
+	`)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %#v", len(result.Rows), result.Rows)
+	}
+	if result.Rows[0][0] != "CA" || result.Rows[0][1] != int64(2) {
+		t.Fatalf("unexpected CA row: %#v", result.Rows[0])
+	}
+	if result.Rows[1][0] != "NY" || result.Rows[1][1] != int64(1) {
+		t.Fatalf("unexpected NY row: %#v", result.Rows[1])
+	}
+}
+
+func TestCorrelatedAggregateSubqueryUsesGroupedResult(t *testing.T) {
+	pool, err := storage.NewKVPool("localhost:8085", 5, 5*time.Second)
+	if err != nil {
+		t.Skipf("PizzaKV not available: %v", err)
+	}
+	defer pool.Close()
+
+	schema := storage.NewSchemaManager(pool, "test_correlated_agg_cache_db")
+	table := storage.NewTableManager(pool, schema, "test_correlated_agg_cache_db")
+	exec := New(schema, table)
+
+	for _, sql := range []string{
+		"DROP TABLE IF EXISTS orders",
+		"DROP TABLE IF EXISTS users",
+		"CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)",
+		"CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER)",
+		"INSERT INTO users VALUES (1, 'a@example.com')",
+		"INSERT INTO users VALUES (2, 'b@example.com')",
+		"INSERT INTO users VALUES (3, 'c@example.com')",
+		"INSERT INTO orders VALUES (10, 1)",
+		"INSERT INTO orders VALUES (11, 1)",
+		"INSERT INTO orders VALUES (12, 3)",
+		"INSERT INTO orders VALUES (13, 3)",
+		"INSERT INTO orders VALUES (14, 3)",
+	} {
+		if _, err := execSQL(exec, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	defer execSQL(exec, "DROP TABLE IF EXISTS orders")
+	defer execSQL(exec, "DROP TABLE IF EXISTS users")
+
+	result, err := execSQL(exec, `
+		SELECT u.id, u.email
+		FROM users u
+		WHERE (
+			SELECT COUNT(*)
+			FROM orders o
+			WHERE o.user_id = u.id
+		) >= 2
+		ORDER BY u.id
+	`)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %#v", len(result.Rows), result.Rows)
+	}
+	if result.Rows[0][0] != int64(1) || result.Rows[1][0] != int64(3) {
+		t.Fatalf("unexpected result rows: %#v", result.Rows)
+	}
+}
+
 // Benchmark
 func BenchmarkEvalExpr(b *testing.B) {
 	exec := &Executor{}
@@ -1348,6 +1457,75 @@ func TestAlterTable(t *testing.T) {
 	// Final cleanup
 	execSQL(exec, "DROP TABLE IF EXISTS test_alter")
 	execSQL(exec, "DROP TABLE IF EXISTS test_renamed")
+}
+
+func TestExecutorResyncsCatalogAfterExternalCreateTable(t *testing.T) {
+	pool, err := storage.NewKVPool("localhost:8085", 5, 5*time.Second)
+	if err != nil {
+		t.Skip("PizzaKV not available, skipping catalog resync tests")
+	}
+	defer pool.Close()
+
+	dbName := fmt.Sprintf("test_catalog_create_%d", time.Now().UnixNano())
+	schema := storage.NewSchemaManager(pool, dbName)
+	table := storage.NewTableManager(pool, schema, dbName)
+
+	staleExec := New(schema, table)
+	if err := staleExec.SyncCatalog(); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+
+	schemaWriter := New(schema, table)
+	if _, err := execSQL(schemaWriter, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatalf("create table through second executor: %v", err)
+	}
+	if _, err := execSQL(schemaWriter, "INSERT INTO users (id, name) VALUES (1, 'Alice')"); err != nil {
+		t.Fatalf("insert through second executor: %v", err)
+	}
+
+	result, err := execSQL(staleExec, "SELECT name FROM users WHERE id = 1")
+	if err != nil {
+		t.Fatalf("stale executor should resync and query new table: %v", err)
+	}
+	if len(result.Rows) != 1 || len(result.Rows[0]) != 1 || result.Rows[0][0] != "Alice" {
+		t.Fatalf("unexpected rows after catalog resync: %#v", result.Rows)
+	}
+}
+
+func TestExecutorResyncsCatalogAfterExternalAlterTable(t *testing.T) {
+	pool, err := storage.NewKVPool("localhost:8085", 5, 5*time.Second)
+	if err != nil {
+		t.Skip("PizzaKV not available, skipping catalog resync tests")
+	}
+	defer pool.Close()
+
+	dbName := fmt.Sprintf("test_catalog_alter_%d", time.Now().UnixNano())
+	schema := storage.NewSchemaManager(pool, dbName)
+	table := storage.NewTableManager(pool, schema, dbName)
+
+	staleExec := New(schema, table)
+	if _, err := execSQL(staleExec, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := execSQL(staleExec, "INSERT INTO users (id, name) VALUES (1, 'Alice')"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := staleExec.SyncCatalog(); err != nil {
+		t.Fatalf("sync after create: %v", err)
+	}
+
+	schemaWriter := New(schema, table)
+	if _, err := execSQL(schemaWriter, "ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'"); err != nil {
+		t.Fatalf("alter table through second executor: %v", err)
+	}
+
+	result, err := execSQL(staleExec, "SELECT status FROM users WHERE id = 1")
+	if err != nil {
+		t.Fatalf("stale executor should resync and query new column: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected one row after catalog resync, got %#v", result.Rows)
+	}
 }
 
 // Test ATTACH/DETACH DATABASE statements
