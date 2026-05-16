@@ -138,7 +138,9 @@ const (
 	// Data types
 	TokenINTEGER
 	TokenINT
+	TokenTINYINT
 	TokenSMALLINT
+	TokenMEDIUMINT
 	TokenBIGINT
 	TokenREAL
 	TokenFLOAT
@@ -149,6 +151,9 @@ const (
 	TokenVARCHAR
 	TokenCHAR
 	TokenCHARACTER
+	TokenCLOB
+	TokenNCHAR
+	TokenNVARCHAR
 	TokenBLOB
 	TokenBOOLEAN
 	TokenDATE
@@ -282,7 +287,9 @@ var keywords = map[string]TokenType{
 	// Data types
 	"INTEGER":   TokenINTEGER,
 	"INT":       TokenINT,
+	"TINYINT":   TokenTINYINT,
 	"SMALLINT":  TokenSMALLINT,
+	"MEDIUMINT": TokenMEDIUMINT,
 	"BIGINT":    TokenBIGINT,
 	"REAL":      TokenREAL,
 	"FLOAT":     TokenFLOAT,
@@ -293,6 +300,9 @@ var keywords = map[string]TokenType{
 	"VARCHAR":   TokenVARCHAR,
 	"CHAR":      TokenCHAR,
 	"CHARACTER": TokenCHARACTER,
+	"CLOB":      TokenCLOB,
+	"NCHAR":     TokenNCHAR,
+	"NVARCHAR":  TokenNVARCHAR,
 	"BLOB":      TokenBLOB,
 	"BOOLEAN":   TokenBOOLEAN,
 	"DATE":      TokenDATE,

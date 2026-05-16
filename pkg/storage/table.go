@@ -391,17 +391,30 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 
 	if filter == nil {
 		result := make([]Row, len(cached))
-		copy(result, cached)
+		for i, row := range cached {
+			result[i] = cloneRow(row)
+		}
 		return result, nil
 	}
 
 	rows := make([]Row, 0, len(cached))
 	for _, row := range cached {
 		if filter(row) {
-			rows = append(rows, row)
+			rows = append(rows, cloneRow(row))
 		}
 	}
 	return rows, nil
+}
+
+func cloneRow(row Row) Row {
+	if row == nil {
+		return nil
+	}
+	cloned := make(Row, len(row))
+	for k, v := range row {
+		cloned[k] = v
+	}
+	return cloned
 }
 
 // SelectWithLimit retrieves rows with limit and offset.

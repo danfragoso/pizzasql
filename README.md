@@ -377,12 +377,12 @@ graph TD
 
 # Export / Import
 -o string            Output file (export)
--i string            Input file (import)
+-i string            Input file (import; .db/.sqlite/.sqlite3 auto-imports from SQLite)
 -table string        Table name (required for CSV)
--format string       Format: sql, csv (auto-detected from extension)
+-format string       Format: sql, csv, sqlite (auto-detected from extension)
 -drop                Include DROP TABLE in SQL export
 -create-table        Create table from CSV schema on import
--ignore-errors       Continue import on row errors
+-ignore-errors       Continue import on row/table errors
 
 # Misc
 -quiet               Suppress request/query logging
@@ -407,6 +407,8 @@ graph TD
 
 ### Database Export / Import
 
+#### SQL export/import
+
 ```bash
 # Export full database
 pizzasql -db mydb -o backup.sql
@@ -426,6 +428,77 @@ pizzasql -db mydb -i backup.sql
 # Import CSV (create table from header)
 pizzasql -db mydb -table users -i users.csv -create-table
 ```
+
+#### SQLite `.db` import
+
+PizzaSQL can import a SQLite database file directly. Tables, indexes, and row data are all imported. Pragmas, views, and triggers are skipped.
+
+**CLI — auto-detected from `.db` / `.sqlite` / `.sqlite3` extension:**
+```bash
+pizzasql -kv -db mydb -i source.db
+```
+
+**Keep going on errors** (e.g. duplicate rows or unsupported DDL):
+```bash
+pizzasql -kv -db mydb -i source.db -ignore-errors
+```
+
+**Insert into an existing database** (skip `CREATE TABLE`, only insert rows):
+```bash
+# Not yet exposed as a CLI flag — use the HTTP API's create_tables=false parameter
+```
+
+**HTTP API — multipart upload:**
+```bash
+curl -X POST http://localhost:8080/import \
+  -H "X-Database: mydb" \
+  -F "file=@source.db"
+```
+
+**HTTP API — raw body** with explicit format:
+```bash
+curl -X POST "http://localhost:8080/import?format=sqlite" \
+  -H "X-Database: mydb" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @source.db
+```
+
+**HTTP API options:**
+
+| Query param | Default | Description |
+|---|---|---|
+| `format` | auto | `sqlite` forces binary SQLite mode |
+| `create_tables` | `true` | `false` skips `CREATE TABLE`, only inserts rows |
+| `ignore_errors` | `false` | Continue past individual row/table errors |
+
+**Response:**
+```json
+{
+  "tablesCreated":  ["users", "albums", "tracks"],
+  "tablesImported": ["users", "albums", "tracks"],
+  "rowsInserted":   27754,
+  "indexesCreated": 61,
+  "errors": []
+}
+```
+
+**What gets imported:**
+- All tables (schema + data)
+- Regular indexes (`CREATE INDEX`)
+
+**What is silently skipped:**
+- Pragmas
+- Views
+- Triggers
+- Expression indexes (e.g. `CREATE INDEX ON t(COALESCE(a, b))`)
+- `FOREIGN KEY` / `CHECK` constraints (schema is imported without them)
+- `AUTOINCREMENT` keyword (not needed — PizzaSQL handles PK generation)
+
+**Supported file detection** (format auto-selection in order):
+1. `?format=sqlite` query param
+2. Filename extension: `.db`, `.sqlite`, `.sqlite3`
+3. Content-Type: `application/x-sqlite3` or `application/octet-stream`
+4. Magic bytes: file starts with `SQLite format 3`
 
 ### SQL Support
 

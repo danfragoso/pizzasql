@@ -3842,6 +3842,22 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 			result.WriteString(toString(arg))
 		}
 		return result.String(), nil
+
+	// Date/Time functions
+	case "DATE":
+		return evalDateFunc(args)
+	case "TIME":
+		return evalTimeFunc(args)
+	case "DATETIME":
+		return evalDatetimeFunc(args)
+	case "JULIANDAY":
+		return evalJuliandayFunc(args)
+	case "UNIXEPOCH":
+		return evalUnixepochFunc(args)
+	case "STRFTIME":
+		return evalStrftimeFunc(args)
+	case "TIMEDIFF":
+		return evalTimediffFunc(args)
 	}
 
 	return nil, nil

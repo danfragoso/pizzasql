@@ -23,6 +23,7 @@ import (
 	pizzaruntime "github.com/danfragoso/pizzasql-next/pkg/runtime"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
+	"github.com/danfragoso/pizzasql-next/pkg/sqliteimport"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
 )
 
@@ -545,7 +546,8 @@ func printHelp() {
 	fmt.Println("  pizzasql -db mydb -table users -o t.sql   Export single table")
 	fmt.Println("  pizzasql -db mydb -o backup.sql -drop     Include DROP TABLE statements")
 	fmt.Println("  pizzasql -db mydb -i backup.sql           Import SQL file")
-	fmt.Println("  pizzasql -db mydb -i backup.sql -ignore-errors  Continue on errors")
+	fmt.Println("  pizzasql -db mydb -i source.db            Import SQLite .db file (auto-detected)")
+	fmt.Println("  pizzasql -db mydb -i source.db -ignore-errors  Import, skip errors")
 	fmt.Println()
 	fmt.Println("CSV Format:")
 	fmt.Println("  pizzasql -db mydb -table users -o users.csv         Export table to CSV")
@@ -709,7 +711,42 @@ func runImport() {
 			}
 		}
 
-	default: // sql, sqlite
+	case "sqlite":
+		// Binary SQLite .db import
+		opts := sqliteimport.DefaultImportOptions()
+		opts.IgnoreErrors = *ignoreErrors
+
+		result, err := sqliteimport.ImportSQLiteFile(*importFile, exec, opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Import failed: %v\n", err)
+			if len(result.Errors) > 0 {
+				fmt.Fprintf(os.Stderr, "Errors:\n")
+				for _, e := range result.Errors {
+					fmt.Fprintf(os.Stderr, "  - %s\n", e)
+				}
+			}
+			os.Exit(1)
+		}
+
+		fmt.Printf("SQLite import completed successfully\n")
+		if len(result.TablesCreated) > 0 {
+			fmt.Printf("  Tables created: %s\n", strings.Join(result.TablesCreated, ", "))
+		}
+		if len(result.TablesImported) > 0 {
+			fmt.Printf("  Tables imported: %s\n", strings.Join(result.TablesImported, ", "))
+		}
+		fmt.Printf("  Rows inserted: %d\n", result.RowsInserted)
+		if result.IndexesCreated > 0 {
+			fmt.Printf("  Indexes created: %d\n", result.IndexesCreated)
+		}
+		if len(result.Errors) > 0 {
+			fmt.Printf("  Warnings/Errors: %d\n", len(result.Errors))
+			for _, e := range result.Errors {
+				fmt.Printf("    - %s\n", e)
+			}
+		}
+
+	default: // sql
 		// Configure import options
 		opts := sqlimport.ImportOptions{
 			IgnoreErrors: *ignoreErrors,

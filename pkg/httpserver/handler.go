@@ -16,6 +16,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
+	"github.com/danfragoso/pizzasql-next/pkg/sqliteimport"
 )
 
 // QueryRequest represents a single query request.
@@ -828,9 +829,23 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 
 	// Auto-detect format from filename extension if not specified
 	if format == "" && filename != "" {
-		if strings.HasSuffix(strings.ToLower(filename), ".csv") {
+		lower := strings.ToLower(filename)
+		if strings.HasSuffix(lower, ".csv") {
 			format = "csv"
+		} else if strings.HasSuffix(lower, ".db") || strings.HasSuffix(lower, ".sqlite") || strings.HasSuffix(lower, ".sqlite3") {
+			format = "sqlite"
 		}
+	}
+	// Detect binary SQLite from content-type
+	if format == "" {
+		ct := strings.ToLower(contentType)
+		if strings.Contains(ct, "application/x-sqlite3") || strings.Contains(ct, "application/octet-stream") {
+			format = "sqlite"
+		}
+	}
+	// Check magic bytes: SQLite files start with "SQLite format 3\000"
+	if format == "" && len(fileContent) >= 16 && string(fileContent[:15]) == "SQLite format 3" {
+		format = "sqlite"
 	}
 	if format == "" {
 		format = "sql"
@@ -865,8 +880,27 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 
 		writeJSON(w, http.StatusOK, result, pretty)
 
-	case "sql", "sqlite":
-		// SQL import
+	case "sqlite":
+		// Binary SQLite .db import
+		opts := sqliteimport.DefaultImportOptions()
+		opts.CreateTables = r.URL.Query().Get("create_tables") != "false"
+		opts.IgnoreErrors = ignoreErrors
+
+		result, err := sqliteimport.ImportSQLiteBytes(fileContent, exec, opts)
+		if err != nil && !ignoreErrors {
+			writeError(w, http.StatusBadRequest, "IMPORT_ERROR", err.Error(), map[string]interface{}{
+				"tablesCreated":  result.TablesCreated,
+				"rowsInserted":   result.RowsInserted,
+				"errors":         result.Errors,
+			})
+			return
+		}
+
+		exec.SyncCatalog()
+		writeJSON(w, http.StatusOK, result, pretty)
+
+	case "sql":
+		// SQL text import
 		opts := sqlimport.DefaultImportOptions()
 		opts.IgnoreErrors = ignoreErrors
 

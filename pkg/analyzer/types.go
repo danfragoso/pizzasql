@@ -113,6 +113,13 @@ func (t Type) IsComparable(other Type) bool {
 	if (t == TypeText || t == TypeBlob) && (other == TypeText || other == TypeBlob) {
 		return true
 	}
+	// NUMERIC/BOOLEAN accepts TEXT (SQLite-compatible: dates stored as text in numeric columns)
+	if (t == TypeNumeric || t == TypeBoolean) && (other == TypeText || other == TypeBlob) {
+		return true
+	}
+	if (other == TypeNumeric || other == TypeBoolean) && (t == TypeText || t == TypeBlob) {
+		return true
+	}
 	return false
 }
 
@@ -212,11 +219,13 @@ var builtinFunctions = map[string]FunctionSignature{
 	"CAST":   {Name: "CAST", MinArgs: 1, MaxArgs: 1, ArgTypes: []Type{TypeAny}, ReturnType: TypeAny, IsAggregate: false},
 
 	// Date/Time functions
-	"DATE":      {Name: "DATE", MinArgs: 1, MaxArgs: -1, ArgTypes: []Type{TypeText}, ReturnType: TypeText, IsAggregate: false},
-	"TIME":      {Name: "TIME", MinArgs: 1, MaxArgs: -1, ArgTypes: []Type{TypeText}, ReturnType: TypeText, IsAggregate: false},
-	"DATETIME":  {Name: "DATETIME", MinArgs: 1, MaxArgs: -1, ArgTypes: []Type{TypeText}, ReturnType: TypeText, IsAggregate: false},
-	"JULIANDAY": {Name: "JULIANDAY", MinArgs: 1, MaxArgs: -1, ArgTypes: []Type{TypeText}, ReturnType: TypeReal, IsAggregate: false},
-	"STRFTIME":  {Name: "STRFTIME", MinArgs: 2, MaxArgs: -1, ArgTypes: []Type{TypeText, TypeText}, ReturnType: TypeText, IsAggregate: false},
+	"DATE":      {Name: "DATE", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"TIME":      {Name: "TIME", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"DATETIME":  {Name: "DATETIME", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"JULIANDAY": {Name: "JULIANDAY", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeReal, IsAggregate: false},
+	"UNIXEPOCH": {Name: "UNIXEPOCH", MinArgs: 0, MaxArgs: -1, ArgTypes: []Type{TypeAny}, ReturnType: TypeInteger, IsAggregate: false},
+	"STRFTIME":  {Name: "STRFTIME", MinArgs: 1, MaxArgs: -1, ArgTypes: []Type{TypeText, TypeAny}, ReturnType: TypeText, IsAggregate: false},
+	"TIMEDIFF":  {Name: "TIMEDIFF", MinArgs: 2, MaxArgs: 2, ArgTypes: []Type{TypeAny, TypeAny}, ReturnType: TypeText, IsAggregate: false},
 
 	// SQLite specific
 	"SQLITE_VERSION": {Name: "SQLITE_VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},

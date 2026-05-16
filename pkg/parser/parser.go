@@ -1070,10 +1070,10 @@ func (p *Parser) parseDataType() (*DataType, error) {
 
 func (p *Parser) isDataTypeKeyword() bool {
 	switch p.curToken.Type {
-	case lexer.TokenINTEGER, lexer.TokenINT, lexer.TokenSMALLINT, lexer.TokenBIGINT,
+	case lexer.TokenINTEGER, lexer.TokenINT, lexer.TokenTINYINT, lexer.TokenSMALLINT, lexer.TokenMEDIUMINT, lexer.TokenBIGINT,
 		lexer.TokenREAL, lexer.TokenFLOAT, lexer.TokenDOUBLE,
 		lexer.TokenNUMERIC, lexer.TokenDECIMAL,
-		lexer.TokenTEXT, lexer.TokenVARCHAR, lexer.TokenCHAR, lexer.TokenCHARACTER,
+		lexer.TokenTEXT, lexer.TokenVARCHAR, lexer.TokenCHAR, lexer.TokenCHARACTER, lexer.TokenCLOB, lexer.TokenNCHAR, lexer.TokenNVARCHAR,
 		lexer.TokenBLOB, lexer.TokenBOOLEAN,
 		lexer.TokenDATE, lexer.TokenTIME, lexer.TokenTIMESTAMP, lexer.TokenDATETIME:
 		return true
