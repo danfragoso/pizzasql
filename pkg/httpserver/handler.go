@@ -17,6 +17,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/sqlexport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqliteimport"
+	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
 
 // QueryRequest represents a single query request.
@@ -368,7 +369,7 @@ func (s *Server) handleSchemaTable(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
 		"status":  "ok",
-		"version": "0.1.0",
+		"version": version.String(),
 		"uptime":  time.Since(s.stats.StartTime).String(),
 	}
 
@@ -631,7 +632,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(w, "# HELP pizzasql_info PizzaSQL server information\n")
 	fmt.Fprintf(w, "# TYPE pizzasql_info gauge\n")
-	fmt.Fprintf(w, "pizzasql_info{version=\"0.1.0\"} 1\n")
+	fmt.Fprintf(w, "pizzasql_info{version=\"%s\"} 1\n", version.PrometheusLabel())
 }
 
 // handleExport handles GET /export

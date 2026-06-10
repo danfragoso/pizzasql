@@ -1,6 +1,9 @@
 package analyzer
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // Type represents a SQL type with SQLite affinity rules.
 type Type int
@@ -229,6 +232,7 @@ var builtinFunctions = map[string]FunctionSignature{
 
 	// SQLite specific
 	"SQLITE_VERSION": {Name: "SQLITE_VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},
+	"PIZZASQL_VERSION": {Name: "PIZZASQL_VERSION", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeText, IsAggregate: false},
 	"LAST_INSERT_ROWID": {Name: "LAST_INSERT_ROWID", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
 	"CHANGES": {Name: "CHANGES", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
 	"TOTAL_CHANGES": {Name: "TOTAL_CHANGES", MinArgs: 0, MaxArgs: 0, ArgTypes: []Type{}, ReturnType: TypeInteger, IsAggregate: false},
@@ -250,6 +254,18 @@ func LookupFunction(name string) (FunctionSignature, bool) {
 func IsAggregateFunction(name string) bool {
 	sig, ok := LookupFunction(name)
 	return ok && sig.IsAggregate
+}
+
+// BuiltinFunctions returns all built-in functions sorted by name.
+func BuiltinFunctions() []FunctionSignature {
+	functions := make([]FunctionSignature, 0, len(builtinFunctions))
+	for _, sig := range builtinFunctions {
+		functions = append(functions, sig)
+	}
+	sort.Slice(functions, func(i, j int) bool {
+		return functions[i].Name < functions[j].Name
+	})
+	return functions
 }
 
 // ColumnInfo describes a column in a table.

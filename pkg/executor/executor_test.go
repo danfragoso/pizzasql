@@ -8,6 +8,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
+	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
 
 func parse(t *testing.T, sql string) parser.Statement {
@@ -596,6 +597,7 @@ func TestEvalSQLiteFunctions(t *testing.T) {
 		// CONCAT
 		{"CONCAT('hello', ' ', 'world')", "hello world", false},
 		{"CONCAT('a', 'b', 'c')", "abc", false},
+		{"PIZZASQL_VERSION()", version.String(), false},
 
 		// MAX/MIN (scalar versions)
 		{"MAX(1, 5, 3)", int64(5), false},

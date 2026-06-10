@@ -3,6 +3,7 @@ module github.com/danfragoso/pizzasql-next
 go 1.25.0
 
 require (
+	github.com/chzyer/readline v1.5.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/google/uuid v1.6.0 // indirect

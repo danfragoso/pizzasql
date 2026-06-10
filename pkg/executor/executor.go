@@ -12,6 +12,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
 	"github.com/danfragoso/pizzasql-next/pkg/parser"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
+	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
 
 // Executor executes SQL statements.
@@ -3012,7 +3013,7 @@ func (e *Executor) pragmaDatabaseList() (*Result, error) {
 func (e *Executor) pragmaVersion() (*Result, error) {
 	result := NewResult("PRAGMA")
 	result.AddColumn("version")
-	result.AddRow("PizzaSQL 1.0.0")
+	result.AddRow(version.String())
 	return result, nil
 }
 
@@ -3858,6 +3859,8 @@ func (e *Executor) evalFunctionCall(fn *parser.FunctionCall, row storage.Row) (i
 		return evalStrftimeFunc(args)
 	case "TIMEDIFF":
 		return evalTimediffFunc(args)
+	case "PIZZASQL_VERSION", "SQLITE_VERSION":
+		return version.String(), nil
 	}
 
 	return nil, nil

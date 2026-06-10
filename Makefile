@@ -2,9 +2,14 @@
 
 PREFIX ?= /usr/local
 
+GIT_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+GIT_COMMIT := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+GIT_DATE := $(shell git show -s --format=%cI HEAD 2>/dev/null || echo unknown)
+LDFLAGS := -X github.com/danfragoso/pizzasql-next/pkg/version.Version=$(GIT_VERSION) -X github.com/danfragoso/pizzasql-next/pkg/version.Commit=$(GIT_COMMIT) -X github.com/danfragoso/pizzasql-next/pkg/version.Date=$(GIT_DATE)
+
 # Build the project
 build:
-	go build -o ./bin/pizzasql ./main.go
+	go build -ldflags "$(LDFLAGS)" -o ./bin/pizzasql ./main.go
 
 # Install pizzasql to PREFIX/bin (default: /usr/local/bin)
 install: build
@@ -18,7 +23,7 @@ uninstall:
 	@echo "Removed $(DESTDIR)$(PREFIX)/bin/pizzasql"
 
 build-linux-amd64:
-	GOOS=linux GOARCH=amd64 go build -o ./bin/pizzasql-linux-amd64 ./main.go
+	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o ./bin/pizzasql-linux-amd64 ./main.go
 
 # Run all tests
 test:

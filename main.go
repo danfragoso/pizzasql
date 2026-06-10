@@ -5,13 +5,17 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/chzyer/readline"
+	"github.com/danfragoso/pizzasql-next/pkg/analyzer"
 	"github.com/danfragoso/pizzasql-next/pkg/csvexport"
 	"github.com/danfragoso/pizzasql-next/pkg/csvimport"
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
@@ -25,6 +29,7 @@ import (
 	"github.com/danfragoso/pizzasql-next/pkg/sqlimport"
 	"github.com/danfragoso/pizzasql-next/pkg/sqliteimport"
 	"github.com/danfragoso/pizzasql-next/pkg/storage"
+	"github.com/danfragoso/pizzasql-next/pkg/version"
 )
 
 var (
@@ -209,6 +214,7 @@ func executePipe() {
 
 func runREPL() {
 	fmt.Println("PizzaSQL - SQL-92 compatible database")
+	fmt.Printf("Build: %s\n", version.String())
 	fmt.Println("Type 'help' for usage, 'quit' to exit")
 	fmt.Println()
 
@@ -231,20 +237,46 @@ func runREPL() {
 		fmt.Printf("Connected to PizzaKV at %s (database: %s)\n\n", *kvAddr, *database)
 	}
 
-	reader := bufio.NewReader(os.Stdin)
+	historyFile := replHistoryFile()
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          "pizzasql> ",
+		HistoryFile:     historyFile,
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+		AutoComplete:    newREPLCompleter(schema),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize interactive input: %v\n", err)
+		return
+	}
+	defer rl.Close()
+
 	var sqlBuffer strings.Builder
 
 	for {
 		if sqlBuffer.Len() == 0 {
-			fmt.Print("pizzasql> ")
+			rl.SetPrompt("pizzasql> ")
 		} else {
-			fmt.Print("       -> ")
+			rl.SetPrompt("       -> ")
 		}
 
-		line, err := reader.ReadString('\n')
+		line, err := rl.Readline()
 		if err != nil {
-			fmt.Println()
-			break
+			if err == readline.ErrInterrupt {
+				if sqlBuffer.Len() > 0 {
+					sqlBuffer.Reset()
+					fmt.Println("Buffer cleared")
+					continue
+				}
+				fmt.Println("^C")
+				continue
+			}
+			if err == io.EOF {
+				fmt.Println()
+				break
+			}
+			fmt.Fprintf(os.Stderr, "Input error: %v\n", err)
+			continue
 		}
 
 		line = strings.TrimSpace(line)
@@ -270,6 +302,12 @@ func runREPL() {
 		case "clear", "\\c":
 			sqlBuffer.Reset()
 			fmt.Println("Buffer cleared")
+			continue
+		case "status", "\\s":
+			printStatus(exec != nil)
+			continue
+		case "functions", "\\df":
+			printFunctions()
 			continue
 		}
 
@@ -305,6 +343,121 @@ func runREPL() {
 			executeExpressionOnly(sql)
 		}
 	}
+}
+
+type replCompleter struct {
+	getTables func() []string
+}
+
+func newREPLCompleter(schema *storage.SchemaManager) readline.AutoCompleter {
+	return &replCompleter{
+		getTables: func() []string {
+			if schema == nil {
+				return nil
+			}
+			tables, err := schema.ListTables()
+			if err != nil {
+				return nil
+			}
+			return tables
+		},
+	}
+}
+
+func (c *replCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	if pos > len(line) {
+		pos = len(line)
+	}
+	fragment := string(line[:pos])
+	start := pos
+	for start > 0 {
+		r := line[start-1]
+		if !(r == '_' || r == '\\' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			break
+		}
+		start--
+	}
+	prefix := fragment[start:pos]
+	prefixUpper := strings.ToUpper(prefix)
+
+	candidates := append(replCommands(), sqlKeywords()...)
+	candidates = append(candidates, c.getTables()...)
+
+	seen := make(map[string]struct{}, len(candidates))
+	var out [][]rune
+	for _, cand := range candidates {
+		cand = strings.TrimSpace(cand)
+		if cand == "" {
+			continue
+		}
+		upper := strings.ToUpper(cand)
+		if _, ok := seen[upper]; ok {
+			continue
+		}
+		seen[upper] = struct{}{}
+		if prefixUpper == "" || strings.HasPrefix(upper, prefixUpper) {
+			suffix := cand
+			if len(prefix) > 0 && len(cand) >= len(prefix) && strings.EqualFold(cand[:len(prefix)], prefix) {
+				suffix = cand[len(prefix):]
+			}
+			suffix = matchSuffixCase(prefix, suffix)
+			out = append(out, []rune(suffix))
+		}
+	}
+
+	return out, len(prefix)
+}
+
+func replHistoryFile() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ".pizzasql_history"
+	}
+	return filepath.Join(home, ".pizzasql_history")
+}
+
+func replCommands() []string {
+	return []string{"help", "quit", "exit", "tables", "clear", "status", "functions", "\\h", "\\q", "\\dt", "\\c", "\\s", "\\df"}
+}
+
+func sqlKeywords() []string {
+	return []string{
+		"SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
+		"CREATE", "TABLE", "DROP", "ALTER", "INDEX", "VIEW", "JOIN", "LEFT", "RIGHT", "INNER",
+		"ON", "GROUP", "BY", "ORDER", "LIMIT", "OFFSET", "HAVING", "DISTINCT", "AS", "AND", "OR",
+		"NOT", "NULL", "TRUE", "FALSE", "PRAGMA", "BEGIN", "COMMIT", "ROLLBACK", "PIZZASQL_VERSION",
+	}
+}
+
+func matchSuffixCase(prefix, suffix string) string {
+	if prefix == "" || suffix == "" {
+		return suffix
+	}
+	hasLetter := false
+	allUpper := true
+	allLower := true
+	for _, r := range prefix {
+		if r >= 'A' && r <= 'Z' {
+			hasLetter = true
+			allLower = false
+			continue
+		}
+		if r >= 'a' && r <= 'z' {
+			hasLetter = true
+			allUpper = false
+			continue
+		}
+	}
+	if !hasLetter {
+		return suffix
+	}
+	if allUpper {
+		return strings.ToUpper(suffix)
+	}
+	if allLower {
+		return strings.ToLower(suffix)
+	}
+	return suffix
 }
 
 func executeSQL(exec *executor.Executor, sql string) (*executor.Result, error) {
@@ -445,6 +598,13 @@ func evalExprSimple(expr parser.Expr) (interface{}, error) {
 		return val, nil
 	case *parser.ParenExpr:
 		return evalExprSimple(e.Expr)
+	case *parser.FunctionCall:
+		switch strings.ToUpper(e.Name) {
+		case "PIZZASQL_VERSION", "SQLITE_VERSION":
+			return version.String(), nil
+		default:
+			return nil, fmt.Errorf("unsupported function in expression mode: %s", e.Name)
+		}
 	}
 	return nil, fmt.Errorf("unsupported expression type: %T", expr)
 }
@@ -528,6 +688,8 @@ func printHelp() {
 	fmt.Println("  quit, \\q     Exit the program")
 	fmt.Println("  tables, \\dt  List all tables")
 	fmt.Println("  clear, \\c    Clear the input buffer")
+	fmt.Println("  status, \\s   Show build and connection status")
+	fmt.Println("  functions, \\df List built-in SQL functions")
 	fmt.Println()
 	fmt.Println("SQL Statements (end with semicolon):")
 	fmt.Println("  SELECT ... FROM ... WHERE ...")
@@ -572,6 +734,36 @@ func listTables(schema *storage.SchemaManager) {
 		fmt.Printf("  %s\n", t)
 	}
 }
+
+func printStatus(connected bool) {
+	fmt.Printf("version: %s\n", version.String())
+	if connected {
+		fmt.Println("storage: connected")
+		return
+	}
+	fmt.Println("storage: expression-only mode")
+}
+
+func printFunctions() {
+	fns := analyzer.BuiltinFunctions()
+	fmt.Println("Built-in SQL functions:")
+	for _, fn := range fns {
+		kind := "scalar"
+		if fn.IsAggregate {
+			kind = "aggregate"
+		}
+		if fn.MaxArgs < 0 {
+			fmt.Printf("  %-18s %s (args: %d+)\n", fn.Name, kind, fn.MinArgs)
+			continue
+		}
+		if fn.MinArgs == fn.MaxArgs {
+			fmt.Printf("  %-18s %s (args: %d)\n", fn.Name, kind, fn.MinArgs)
+			continue
+		}
+		fmt.Printf("  %-18s %s (args: %d..%d)\n", fn.Name, kind, fn.MinArgs, fn.MaxArgs)
+	}
+}
+
 func runExport() {
 	// Connect to PizzaKV
 	pool, err := storage.NewKVPool(*kvAddr, *poolSize, *timeout)
