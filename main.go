@@ -36,6 +36,7 @@ var (
 	kvAddr          = flag.String("kvaddr", "", "PizzaKV server address (default: auto-connect to managed instance)")
 	kvLaunch        = flag.Bool("kv", false, "Launch PizzaKV automatically")
 	kvFlags         = flag.String("kvflags", "", "Flags to pass to PizzaKV (e.g., \"-iwal\")")
+	forceYes        = flag.Bool("y", false, "Auto-accept prompts (skip interactive confirmation)")
 	database        = flag.String("db", "pizzasql", "Database name")
 	poolSize        = flag.Int("pool", 100, "Connection pool size")
 	timeout         = flag.Duration("timeout", 120*time.Second, "Query timeout")
@@ -70,7 +71,7 @@ func main() {
 	flag.Parse()
 
 	// Warn if other pizzasql instances are running; prompt to continue.
-	if err := pizzaruntime.CheckExistingInstances(); err != nil {
+	if err := pizzaruntime.CheckExistingInstances(*forceYes); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
@@ -1076,17 +1077,19 @@ func runServers() {
 // launchPizzaKV starts a dedicated PizzaKV instance for this pizzasql process.
 func launchPizzaKV() error {
 	if _, err := os.Stat(".db"); err == nil {
-		if live := pizzaruntime.LiveInstances(); len(live) > 0 {
-			inst := live[0]
-			kvAddr := "<addr>"
-			if inst.PizzaKV != nil {
-				kvAddr = inst.PizzaKV.Addr
+		if !*forceYes {
+			if live := pizzaruntime.LiveInstances(); len(live) > 0 {
+				inst := live[0]
+				kvAddr := "<addr>"
+				if inst.PizzaKV != nil {
+					kvAddr = inst.PizzaKV.Addr
+				}
+				return fmt.Errorf(".db file already exists and another pizzasql instance is running (PID %d)\n"+
+					"  To connect to its pizzakv:      pizzasql -kvaddr=%s\n"+
+					"  To start fresh (removes data):  rm .db && pizzasql -kv\n"+
+					"  To run a separate instance:     cd /other/dir && pizzasql -kv",
+					inst.PizzaSQL.PID, kvAddr)
 			}
-			return fmt.Errorf(".db file already exists and another pizzasql instance is running (PID %d)\n"+
-				"  To connect to its pizzakv:      pizzasql -kvaddr=%s\n"+
-				"  To start fresh (removes data):  rm .db && pizzasql -kv\n"+
-				"  To run a separate instance:     cd /other/dir && pizzasql -kv",
-				inst.PizzaSQL.PID, kvAddr)
 		}
 	}
 

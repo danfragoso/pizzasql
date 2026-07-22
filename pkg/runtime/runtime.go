@@ -129,7 +129,7 @@ func LiveInstances() []*Info {
 
 // CheckExistingInstances warns about live instances and prompts the user.
 // Returns an error only if the user declines to continue.
-func CheckExistingInstances() error {
+func CheckExistingInstances(force bool) error {
 	live := LiveInstances()
 	if len(live) == 0 {
 		return nil
@@ -149,6 +149,12 @@ func CheckExistingInstances() error {
 		}
 		fmt.Fprintf(os.Stderr, "  PID %d%s\n", info.PizzaSQL.PID, extra)
 	}
+
+	if force {
+		fmt.Fprintf(os.Stderr, "Auto-continuing (-y flag set)\n")
+		return nil
+	}
+
 	fmt.Fprintf(os.Stderr, "Continue anyway? [y/N] ")
 
 	reader := bufio.NewReader(os.Stdin)
