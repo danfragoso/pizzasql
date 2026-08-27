@@ -34,6 +34,9 @@ func (p *Parser) Parse() (Statement, error) {
 	if p.curTokenIs(lexer.TokenSemicolon) {
 		p.nextToken()
 	}
+	if !p.curTokenIs(lexer.TokenEOF) {
+		return nil, p.curError("unexpected trailing token: " + p.curToken.Type.String())
+	}
 
 	return stmt, nil
 }
@@ -779,6 +782,62 @@ func (p *Parser) parseInsert() (*InsertStmt, error) {
 		return nil, p.curError("expected VALUES or SELECT")
 	}
 
+	if p.curTokenIs(lexer.TokenON) {
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenCONFLICT) {
+			return nil, p.curError("expected CONFLICT after ON")
+		}
+		p.nextToken()
+		if p.curTokenIs(lexer.TokenLParen) {
+			p.nextToken()
+			target, err := p.parseIdentList()
+			if err != nil {
+				return nil, err
+			}
+			stmt.ConflictTarget = target
+			if !p.curTokenIs(lexer.TokenRParen) {
+				return nil, p.curError("expected )")
+			}
+			p.nextToken()
+		}
+		if !p.curTokenIs(lexer.TokenDO) {
+			return nil, p.curError("expected DO after ON CONFLICT")
+		}
+		p.nextToken()
+		if p.curTokenIs(lexer.TokenNOTHING) {
+			stmt.ConflictDoNothing = true
+			p.nextToken()
+		} else if p.curTokenIs(lexer.TokenUPDATE) {
+			p.nextToken()
+			if !p.curTokenIs(lexer.TokenSET) {
+				return nil, p.curError("expected SET after DO UPDATE")
+			}
+			p.nextToken()
+			for {
+				if !p.curTokenIs(lexer.TokenIdent) {
+					return nil, p.curError("expected column name")
+				}
+				column := p.curToken.Literal
+				p.nextToken()
+				if !p.curTokenIs(lexer.TokenEq) {
+					return nil, p.curError("expected =")
+				}
+				p.nextToken()
+				value, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				stmt.ConflictUpdate = append(stmt.ConflictUpdate, Assignment{Column: column, Value: value})
+				if !p.curTokenIs(lexer.TokenComma) {
+					break
+				}
+				p.nextToken()
+			}
+		} else {
+			return nil, p.curError("expected NOTHING or UPDATE after DO")
+		}
+	}
+
 	return stmt, nil
 }
 
@@ -1075,7 +1134,7 @@ func (p *Parser) isDataTypeKeyword() bool {
 		lexer.TokenNUMERIC, lexer.TokenDECIMAL,
 		lexer.TokenTEXT, lexer.TokenVARCHAR, lexer.TokenCHAR, lexer.TokenCHARACTER, lexer.TokenCLOB, lexer.TokenNCHAR, lexer.TokenNVARCHAR,
 		lexer.TokenBLOB, lexer.TokenBOOLEAN,
-		lexer.TokenDATE, lexer.TokenTIME, lexer.TokenTIMESTAMP, lexer.TokenDATETIME:
+		lexer.TokenDATE, lexer.TokenTIME, lexer.TokenTIMESTAMP, lexer.TokenDATETIME, lexer.TokenJSON, lexer.TokenJSONB:
 		return true
 	}
 	return false
@@ -1522,13 +1581,27 @@ func (p *Parser) parseAlterTableAdd(stmt *AlterTableStmt) (*AlterTableStmt, erro
 		p.nextToken()
 	}
 
+	ifNotExists := false
+	if p.curTokenIs(lexer.TokenIF) {
+		ifNotExists = true
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenNOT) {
+			return nil, p.curError("expected NOT after IF")
+		}
+		p.nextToken()
+		if !p.curTokenIs(lexer.TokenEXISTS) {
+			return nil, p.curError("expected EXISTS after IF NOT")
+		}
+		p.nextToken()
+	}
+
 	// Parse column definition
 	col, err := p.parseColumnDef()
 	if err != nil {
 		return nil, err
 	}
 
-	stmt.Action = &AddColumnAction{Column: col}
+	stmt.Action = &AddColumnAction{Column: col, IfNotExists: ifNotExists}
 	return stmt, nil
 }
 

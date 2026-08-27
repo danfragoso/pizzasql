@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -308,6 +309,35 @@ func (p *KVPool) WithClient(fn func(*KVClient) error) error {
 	if err != nil {
 		return err
 	}
-	defer p.Put(client)
-	return fn(client)
+	if err := fn(client); err != nil {
+		if !isConnectionError(err) {
+			p.Put(client)
+			return err
+		}
+		// A timeout or short response can leave an acknowledgement buffered on
+		// this connection. Never let the next request consume that response.
+		client.Close()
+		p.mu.Lock()
+		if !p.closed {
+			select {
+			case p.pool <- nil:
+			default:
+			}
+		}
+		p.mu.Unlock()
+		return err
+	}
+	p.Put(client)
+	return nil
+}
+
+func isConnectionError(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	message := err.Error()
+	return strings.Contains(message, "write command failed:") ||
+		strings.Contains(message, "flush failed:") ||
+		strings.Contains(message, "read response failed:")
 }

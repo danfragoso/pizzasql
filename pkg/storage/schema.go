@@ -53,7 +53,21 @@ type SchemaManager struct {
 	rowIDInitialized map[string]bool
 	version          uint64
 	mu               sync.RWMutex
+	txMu             sync.RWMutex
 }
+
+// BeginTransaction prevents other connections from observing intermediate
+// changes until this connection commits or rolls back.
+func (m *SchemaManager) BeginTransaction() { m.txMu.Lock() }
+
+// EndTransaction releases the database transaction lock.
+func (m *SchemaManager) EndTransaction() { m.txMu.Unlock() }
+
+// LockStatement serializes a non-transactional statement with transactions.
+func (m *SchemaManager) LockStatement() { m.txMu.RLock() }
+
+// UnlockStatement releases a non-transactional statement lock.
+func (m *SchemaManager) UnlockStatement() { m.txMu.RUnlock() }
 
 // NewSchemaManager creates a new schema manager.
 func NewSchemaManager(pool *KVPool, database string) *SchemaManager {
@@ -118,7 +132,9 @@ func (m *SchemaManager) CreateTable(schema *Schema) error {
 		return fmt.Errorf("table already exists: %s", schema.Name)
 	}
 
-	// Set creation time
+	// Keep the cached schema private so callers cannot mutate a published
+	// catalog snapshot after this operation returns.
+	schema = cloneSchema(schema)
 	schema.CreatedAt = time.Now()
 
 	// Determine primary key if not set
@@ -229,7 +245,7 @@ func (m *SchemaManager) GetSchema(name string) (*Schema, error) {
 	m.mu.RLock()
 	if schema, ok := m.cache[strings.ToLower(name)]; ok {
 		m.mu.RUnlock()
-		return schema, nil
+		return cloneSchema(schema), nil
 	}
 	m.mu.RUnlock()
 
@@ -238,7 +254,7 @@ func (m *SchemaManager) GetSchema(name string) (*Schema, error) {
 
 	// Double-check after acquiring write lock
 	if schema, ok := m.cache[strings.ToLower(name)]; ok {
-		return schema, nil
+		return cloneSchema(schema), nil
 	}
 
 	key := m.schemaKey(name)
@@ -261,7 +277,16 @@ func (m *SchemaManager) GetSchema(name string) (*Schema, error) {
 	}
 
 	m.cache[strings.ToLower(name)] = &schema
-	return &schema, nil
+	return cloneSchema(&schema), nil
+}
+
+func cloneSchema(schema *Schema) *Schema {
+	if schema == nil {
+		return nil
+	}
+	cloned := *schema
+	cloned.Columns = append([]Column(nil), schema.Columns...)
+	return &cloned
 }
 
 // TableExists checks if a table exists.
@@ -767,7 +792,8 @@ func (m *SchemaManager) AddColumn(table string, column Column) error {
 		}
 	}
 
-	// Add column
+	// Publish a fresh snapshot instead of mutating readers' shared pointer.
+	schema = cloneSchema(schema)
 	schema.Columns = append(schema.Columns, column)
 
 	// Update schema
@@ -804,6 +830,7 @@ func (m *SchemaManager) DropColumn(table, columnName string) error {
 		return fmt.Errorf("column not found: %s", columnName)
 	}
 
+	schema = cloneSchema(schema)
 	schema.Columns = newColumns
 
 	// Update schema
@@ -827,6 +854,7 @@ func (m *SchemaManager) RenameTable(oldName, newName string) error {
 		return fmt.Errorf("table already exists: %s", newName)
 	}
 
+	schema = cloneSchema(schema)
 	// Update schema name
 	schema.Name = newName
 
@@ -896,6 +924,7 @@ func (m *SchemaManager) RenameColumn(table, oldName, newName string) error {
 		}
 	}
 
+	schema = cloneSchema(schema)
 	// Find and rename column
 	found := false
 	for i, col := range schema.Columns {

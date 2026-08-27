@@ -576,8 +576,9 @@ func (a *Analyzer) analyzeCreateTable(stmt *parser.CreateTableStmt) error {
 		}
 	}
 
-	// Add to catalog
-	return a.catalog.CreateTable(tableInfo)
+	// Analysis is validation-only. Publishing the table before the durable
+	// schema write can leave a phantom catalog entry when that write fails.
+	return nil
 }
 
 // analyzeDropTable analyzes a DROP TABLE statement.

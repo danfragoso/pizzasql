@@ -1138,15 +1138,10 @@ func TestTransactions(t *testing.T) {
 			t.Error("expected inTransaction to be false after ROLLBACK")
 		}
 
-		// Verify data was NOT committed (rollback currently doesn't undo changes due to PizzaKV limitations)
-		// This is a known limitation - the transaction log is built but rollback doesn't restore state
+		// Verify data was not committed.
 		checkResult, _ := execSQL(exec, "SELECT * FROM tx_test WHERE id = 2")
-		// Note: In the current implementation, rollback doesn't actually undo changes
-		// This test documents current behavior
-		if checkResult.RowCount == 0 {
-			t.Log("ROLLBACK successfully prevented data persistence (ideal)")
-		} else {
-			t.Log("ROLLBACK did not undo changes (current limitation)")
+		if checkResult.RowCount != 0 {
+			t.Errorf("expected no rows after rollback, got %d", checkResult.RowCount)
 		}
 	})
 
@@ -1197,6 +1192,11 @@ func TestTransactions(t *testing.T) {
 		// Should still be in transaction
 		if !exec.inTransaction {
 			t.Error("expected to still be in transaction after ROLLBACK TO")
+		}
+		before, _ := execSQL(exec, "SELECT * FROM tx_test WHERE id = 10")
+		after, _ := execSQL(exec, "SELECT * FROM tx_test WHERE id = 11")
+		if before.RowCount != 1 || after.RowCount != 0 {
+			t.Errorf("unexpected savepoint rollback rows: before=%d after=%d", before.RowCount, after.RowCount)
 		}
 
 		execSQL(exec, "ROLLBACK")

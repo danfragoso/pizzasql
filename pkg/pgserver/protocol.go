@@ -81,6 +81,7 @@ const (
 	ErrCodeConnectionFailure   = "08006"
 	ErrCodeProtocolViolation   = "08P01"
 	ErrCodeFeatureNotSupported = "0A000"
+	ErrCodeTransactionAborted  = "25P02"
 )
 
 // Message represents a PostgreSQL protocol message
@@ -214,8 +215,8 @@ func NewMessageBuilder() *MessageBuilder {
 	}
 }
 
-// WriteByte writes a single byte
-func (mb *MessageBuilder) WriteByte(b byte) {
+// AppendByte appends a single byte.
+func (mb *MessageBuilder) AppendByte(b byte) {
 	mb.data = append(mb.data, b)
 }
 

@@ -114,11 +114,14 @@ const (
 
 // InsertStmt represents an INSERT statement.
 type InsertStmt struct {
-	Table      *TableRef
-	Columns    []string
-	Values     [][]Expr
-	Select     *SelectStmt    // INSERT ... SELECT
-	OnConflict ConflictAction // OR REPLACE/IGNORE/etc.
+	Table             *TableRef
+	Columns           []string
+	Values            [][]Expr
+	Select            *SelectStmt    // INSERT ... SELECT
+	OnConflict        ConflictAction // OR REPLACE/IGNORE/etc.
+	ConflictTarget    []string
+	ConflictUpdate    []Assignment
+	ConflictDoNothing bool
 }
 
 func (s *InsertStmt) node()     {}
@@ -278,7 +281,8 @@ type AlterAction interface {
 
 // AddColumnAction represents ADD COLUMN action.
 type AddColumnAction struct {
-	Column *ColumnDef
+	Column      *ColumnDef
+	IfNotExists bool
 }
 
 func (a *AddColumnAction) node()        {}

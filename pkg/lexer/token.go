@@ -160,6 +160,8 @@ const (
 	TokenTIME
 	TokenTIMESTAMP
 	TokenDATETIME
+	TokenJSON
+	TokenJSONB
 
 	// Transaction keywords
 	TokenBEGIN
@@ -185,6 +187,9 @@ const (
 	TokenIGNORE
 	TokenFAIL
 	TokenABORT
+	TokenCONFLICT
+	TokenDO
+	TokenNOTHING
 )
 
 var keywords = map[string]TokenType{
@@ -309,6 +314,8 @@ var keywords = map[string]TokenType{
 	"TIME":      TokenTIME,
 	"TIMESTAMP": TokenTIMESTAMP,
 	"DATETIME":  TokenDATETIME,
+	"JSON":      TokenJSON,
+	"JSONB":     TokenJSONB,
 
 	// Transactions
 	"BEGIN":       TokenBEGIN,
@@ -330,10 +337,13 @@ var keywords = map[string]TokenType{
 	"REINDEX": TokenREINDEX,
 
 	// Conflict resolution
-	"REPLACE": TokenREPLACE,
-	"IGNORE":  TokenIGNORE,
-	"FAIL":    TokenFAIL,
-	"ABORT":   TokenABORT,
+	"REPLACE":  TokenREPLACE,
+	"IGNORE":   TokenIGNORE,
+	"FAIL":     TokenFAIL,
+	"ABORT":    TokenABORT,
+	"CONFLICT": TokenCONFLICT,
+	"DO":       TokenDO,
+	"NOTHING":  TokenNOTHING,
 }
 
 // LookupKeyword returns the token type for an identifier.

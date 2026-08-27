@@ -768,6 +768,35 @@ func TestParseMultiple(t *testing.T) {
 	}
 }
 
+func TestParseRejectsTrailingReturning(t *testing.T) {
+	l := lexer.New("INSERT INTO users (id) VALUES (1) RETURNING id")
+	if _, err := New(l).Parse(); err == nil {
+		t.Fatal("expected RETURNING to be rejected before execution")
+	}
+}
+
+func TestParsePostgresCompatibilityClauses(t *testing.T) {
+	t.Run("alter add column if not exists", func(t *testing.T) {
+		stmt := parse(t, "ALTER TABLE users ADD COLUMN IF NOT EXISTS revision INTEGER DEFAULT 0")
+		action := stmt.(*AlterTableStmt).Action.(*AddColumnAction)
+		if !action.IfNotExists || action.Column.Name != "revision" {
+			t.Fatalf("unexpected action: %#v", action)
+		}
+	})
+
+	t.Run("on conflict do update", func(t *testing.T) {
+		stmt := parse(t, "INSERT INTO users (id, count) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET count = users.count + 1")
+		insert := stmt.(*InsertStmt)
+		if len(insert.ConflictTarget) != 1 || insert.ConflictTarget[0] != "id" || len(insert.ConflictUpdate) != 1 {
+			t.Fatalf("unexpected conflict clause: %#v", insert)
+		}
+	})
+
+	t.Run("jsonb cast", func(t *testing.T) {
+		parse(t, "SELECT CAST('{}' AS JSONB)")
+	})
+}
+
 // Phase 4: PRAGMA and EXPLAIN tests
 
 func TestParsePragmaTableInfo(t *testing.T) {

@@ -29,9 +29,10 @@ type Executor struct {
 	currentDatabase   string                         // current database alias (default is "main")
 
 	// Transaction state
-	inTransaction bool
-	savepoints    []string     // stack of savepoint names
-	txLog         []txLogEntry // transaction log for rollback
+	inTransaction      bool
+	savepoints         []string // stack of savepoint names
+	savepointPositions []int
+	txLog              []txLogEntry // transaction log for rollback
 
 	// Subquery context for correlated subqueries
 	outerRow storage.Row
@@ -132,6 +133,10 @@ func (e *Executor) SyncCatalog() error {
 
 // Execute executes a SQL statement.
 func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
+	if _, beginning := stmt.(*parser.BeginStmt); !beginning && !e.inTransaction {
+		e.schema.LockStatement()
+		defer e.schema.UnlockStatement()
+	}
 	e.subqueryCache = make(map[*parser.SelectStmt]*Result)
 	e.correlatedAggCache = make(map[*parser.SelectStmt]*correlatedAggCache)
 	defer func() {
@@ -2144,7 +2149,18 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 			}
 			rows = append(rows, row)
 		}
-		count, err := e.table.InsertBulk(tableName, rows)
+		var count int
+		if e.inTransaction {
+			for _, row := range rows {
+				if err := e.table.Insert(tableName, row); err != nil {
+					return nil, err
+				}
+				e.txLog = append(e.txLog, txLogEntry{operation: "INSERT", table: tableName, key: fmt.Sprintf("%v", row[schema.PrimaryKey])})
+				count++
+			}
+		} else {
+			count, err = e.table.InsertBulk(tableName, rows)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -2183,6 +2199,46 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 
 		err := e.table.Insert(tableName, row)
 		if err != nil {
+			if strings.Contains(err.Error(), "duplicate") && (stmt.ConflictDoNothing || len(stmt.ConflictUpdate) > 0) {
+				if stmt.ConflictDoNothing {
+					continue
+				}
+				if len(stmt.ConflictTarget) > 0 && !containsFold(stmt.ConflictTarget, schema.PrimaryKey) {
+					return nil, fmt.Errorf("ON CONFLICT target must include primary key %s", schema.PrimaryKey)
+				}
+				pkValue := row[schema.PrimaryKey]
+				var oldRows []storage.Row
+				if e.inTransaction {
+					oldRows, _ = e.table.Select(tableName, func(existing storage.Row) bool {
+						return fmt.Sprintf("%v", existing[schema.PrimaryKey]) == fmt.Sprintf("%v", pkValue)
+					})
+				}
+				updated, updateErr := e.table.UpdateFunc(tableName, func(existing storage.Row) (storage.Row, error) {
+					context := e.addTableAlias(existing, tableName)
+					updates := make(storage.Row)
+					for _, assignment := range stmt.ConflictUpdate {
+						value, evalErr := e.evalExpr(assignment.Value, context)
+						if evalErr != nil {
+							return nil, evalErr
+						}
+						updates[assignment.Column] = value
+					}
+					return updates, nil
+				}, func(existing storage.Row) bool {
+					return fmt.Sprintf("%v", existing[schema.PrimaryKey]) == fmt.Sprintf("%v", pkValue)
+				})
+				if updateErr != nil {
+					return nil, updateErr
+				}
+				if updated != 1 {
+					return nil, fmt.Errorf("ON CONFLICT row disappeared during update")
+				}
+				if e.inTransaction && len(oldRows) == 1 {
+					e.txLog = append(e.txLog, txLogEntry{operation: "UPDATE", table: tableName, key: fmt.Sprintf("%v", pkValue), oldData: oldRows[0]})
+				}
+				count++
+				continue
+			}
 			// Handle conflict based on OnConflict action
 			if strings.Contains(err.Error(), "duplicate") {
 				switch stmt.OnConflict {
@@ -2213,6 +2269,9 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 				return nil, err
 			}
 		}
+		if e.inTransaction {
+			e.txLog = append(e.txLog, txLogEntry{operation: "INSERT", table: tableName, key: fmt.Sprintf("%v", row[schema.PrimaryKey])})
+		}
 		count++
 	}
 
@@ -2221,9 +2280,22 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 	return result, nil
 }
 
+func containsFold(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, target) {
+			return true
+		}
+	}
+	return false
+}
+
 // executeUpdate executes an UPDATE statement.
 func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 	tableName := stmt.Table.Name
+	schema, err := e.schema.GetSchema(tableName)
+	if err != nil {
+		return nil, err
+	}
 
 	// Build filter
 	var filter func(storage.Row) bool
@@ -2250,9 +2322,19 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		return updates, nil
 	}
 
+	var oldRows []storage.Row
+	if e.inTransaction {
+		oldRows, err = e.table.Select(tableName, filter)
+		if err != nil {
+			return nil, err
+		}
+	}
 	count, err := e.table.UpdateFunc(tableName, updateFn, filter)
 	if err != nil {
 		return nil, err
+	}
+	for i := 0; e.inTransaction && i < count && i < len(oldRows); i++ {
+		e.txLog = append(e.txLog, txLogEntry{operation: "UPDATE", table: tableName, key: fmt.Sprintf("%v", oldRows[i][schema.PrimaryKey]), oldData: oldRows[i]})
 	}
 
 	result := NewResult("UPDATE")
@@ -2263,6 +2345,10 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 // executeDelete executes a DELETE statement.
 func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 	tableName := stmt.Table.Name
+	schema, err := e.schema.GetSchema(tableName)
+	if err != nil {
+		return nil, err
+	}
 
 	// Build filter
 	var filter func(storage.Row) bool
@@ -2276,9 +2362,19 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 		}
 	}
 
+	var oldRows []storage.Row
+	if e.inTransaction {
+		oldRows, err = e.table.Select(tableName, filter)
+		if err != nil {
+			return nil, err
+		}
+	}
 	count, err := e.table.Delete(tableName, filter)
 	if err != nil {
 		return nil, err
+	}
+	for i := 0; e.inTransaction && i < count && i < len(oldRows); i++ {
+		e.txLog = append(e.txLog, txLogEntry{operation: "DELETE", table: tableName, key: fmt.Sprintf("%v", oldRows[i][schema.PrimaryKey]), oldData: oldRows[i]})
 	}
 
 	result := NewResult("DELETE")
@@ -2344,11 +2440,15 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	}
 
 	if err := e.schema.CreateTable(schema); err != nil {
+		if stmt.IfNotExists && strings.Contains(err.Error(), "table already exists") {
+			return NewResult("CREATE TABLE"), nil
+		}
 		return nil, err
 	}
 
-	// Update analyzer catalog
-	e.catalog.CreateTable(schema.ToAnalyzerTableInfo())
+	if err := e.SyncCatalog(); err != nil {
+		return nil, err
+	}
 
 	result := NewResult("CREATE TABLE")
 	return result, nil
@@ -2385,8 +2485,9 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 			return nil, err
 		}
 
-		// Update analyzer catalog
-		e.catalog.DropTable(tableRef.Name)
+	}
+	if err := e.SyncCatalog(); err != nil {
+		return nil, err
 	}
 
 	result := NewResult("DROP TABLE")
@@ -2436,6 +2537,9 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 	}
 
 	if err := e.schema.CreateIndex(index); err != nil {
+		if stmt.IfNotExists && strings.Contains(err.Error(), "index already exists") {
+			return NewResult("CREATE INDEX"), nil
+		}
 		return nil, err
 	}
 
@@ -2575,6 +2679,15 @@ func (e *Executor) executeAlterTable(stmt *parser.AlterTableStmt) (*Result, erro
 
 // executeAlterTableAddColumn adds a column to a table.
 func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddColumnAction) (*Result, error) {
+	if action.IfNotExists {
+		schema, err := e.schema.GetSchema(table)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := schema.GetColumn(action.Column.Name); exists {
+			return NewResult("ALTER TABLE"), nil
+		}
+	}
 	col := storage.Column{
 		Name:     action.Column.Name,
 		Type:     action.Column.Type.Name,
@@ -2598,6 +2711,9 @@ func (e *Executor) executeAlterTableAddColumn(table string, action *parser.AddCo
 	}
 
 	if err := e.schema.AddColumn(table, col); err != nil {
+		if action.IfNotExists && strings.Contains(err.Error(), "column already exists") {
+			return NewResult("ALTER TABLE"), nil
+		}
 		return nil, err
 	}
 
@@ -2657,7 +2773,9 @@ func (e *Executor) executeBegin(stmt *parser.BeginStmt) (*Result, error) {
 
 	e.inTransaction = true
 	e.savepoints = nil
+	e.savepointPositions = nil
 	e.txLog = nil
+	e.schema.BeginTransaction()
 
 	result := NewResult("BEGIN")
 	return result, nil
@@ -2672,7 +2790,9 @@ func (e *Executor) executeCommit(stmt *parser.CommitStmt) (*Result, error) {
 	// Clear transaction state
 	e.inTransaction = false
 	e.savepoints = nil
+	e.savepointPositions = nil
 	e.txLog = nil
+	e.schema.EndTransaction()
 
 	result := NewResult("COMMIT")
 	return result, nil
@@ -2690,18 +2810,25 @@ func (e *Executor) executeRollback(stmt *parser.RollbackStmt) (*Result, error) {
 	}
 
 	// Full rollback - undo all operations in reverse order
+	var rollbackErr error
 	for i := len(e.txLog) - 1; i >= 0; i-- {
 		entry := e.txLog[i]
 		if err := e.undoOperation(entry); err != nil {
-			// Log error but continue with rollback
-			continue
+			if rollbackErr == nil {
+				rollbackErr = err
+			}
 		}
 	}
 
 	// Clear transaction state
 	e.inTransaction = false
 	e.savepoints = nil
+	e.savepointPositions = nil
 	e.txLog = nil
+	e.schema.EndTransaction()
+	if rollbackErr != nil {
+		return nil, fmt.Errorf("rollback failed: %w", rollbackErr)
+	}
 
 	result := NewResult("ROLLBACK")
 	return result, nil
@@ -2713,10 +2840,12 @@ func (e *Executor) executeSavepoint(stmt *parser.SavepointStmt) (*Result, error)
 		// SQLite allows SAVEPOINT outside transaction (starts implicit transaction)
 		e.inTransaction = true
 		e.txLog = nil
+		e.schema.BeginTransaction()
 	}
 
 	// Add savepoint marker
 	e.savepoints = append(e.savepoints, stmt.Name)
+	e.savepointPositions = append(e.savepointPositions, len(e.txLog))
 
 	result := NewResult("SAVEPOINT")
 	return result, nil
@@ -2733,6 +2862,7 @@ func (e *Executor) executeRelease(stmt *parser.ReleaseStmt) (*Result, error) {
 	for i := len(e.savepoints) - 1; i >= 0; i-- {
 		if e.savepoints[i] == stmt.Name {
 			e.savepoints = e.savepoints[:i]
+			e.savepointPositions = e.savepointPositions[:i]
 			found = true
 			break
 		}
@@ -2828,23 +2958,32 @@ func (e *Executor) rollbackToSavepoint(name string) (*Result, error) {
 		return nil, fmt.Errorf("no such savepoint: %s", name)
 	}
 
-	// Count operations to undo (operations after the savepoint)
-	// For simplicity, we track savepoint positions by counting log entries
-	// In a real implementation, we'd track log positions per savepoint
-
 	// Undo operations in reverse order
-	for i := len(e.txLog) - 1; i >= 0; i-- {
+	logPosition := e.savepointPositions[savepointIdx]
+	for i := len(e.txLog) - 1; i >= logPosition; i-- {
 		entry := e.txLog[i]
 		if err := e.undoOperation(entry); err != nil {
 			continue
 		}
 	}
+	e.txLog = e.txLog[:logPosition]
 
 	// Remove savepoints after the target
 	e.savepoints = e.savepoints[:savepointIdx+1]
+	e.savepointPositions = e.savepointPositions[:savepointIdx+1]
 
 	result := NewResult("ROLLBACK")
 	return result, nil
+}
+
+// RollbackActive rolls back an open transaction, such as when its client
+// disconnects before sending COMMIT or ROLLBACK.
+func (e *Executor) RollbackActive() error {
+	if !e.inTransaction {
+		return nil
+	}
+	_, err := e.executeRollback(&parser.RollbackStmt{})
+	return err
 }
 
 // undoOperation reverses a single operation.

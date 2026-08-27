@@ -8,6 +8,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
@@ -18,34 +21,56 @@ import (
 
 // Connection represents a client connection
 type Connection struct {
-	conn      net.Conn
-	reader    *bufio.Reader
-	writer    *bufio.Writer
-	executor  *executor.Executor
-	schema    *storage.SchemaManager
-	dbManager *storage.DatabaseManager
-	database  string
-	params    map[string]string
-	txStatus  byte
-	quiet     bool // Disable query logging
+	conn           net.Conn
+	reader         *bufio.Reader
+	writer         *bufio.Writer
+	executor       *executor.Executor
+	schema         *storage.SchemaManager
+	dbManager      *storage.DatabaseManager
+	database       string
+	params         map[string]string
+	txStatus       byte
+	quiet          bool // Disable query logging
+	statements     map[string]*preparedStatement
+	portals        map[string]*portal
+	extendedFailed bool
+}
+
+type preparedStatement struct {
+	query     string
+	paramOIDs []int32
+}
+
+type portal struct {
+	query    string
+	executed bool
 }
 
 // NewConnection creates a new connection handler
 func NewConnection(conn net.Conn, dbManager *storage.DatabaseManager, quiet bool) *Connection {
 	return &Connection{
-		conn:      conn,
-		reader:    bufio.NewReader(conn),
-		writer:    bufio.NewWriter(conn),
-		dbManager: dbManager,
-		params:    make(map[string]string),
-		txStatus:  TxStatusIdle,
-		quiet:     quiet,
+		conn:       conn,
+		reader:     bufio.NewReader(conn),
+		writer:     bufio.NewWriter(conn),
+		dbManager:  dbManager,
+		params:     make(map[string]string),
+		statements: make(map[string]*preparedStatement),
+		portals:    make(map[string]*portal),
+		txStatus:   TxStatusIdle,
+		quiet:      quiet,
 	}
 }
 
 // Handle processes the connection
 func (c *Connection) Handle() error {
-	defer c.conn.Close()
+	defer func() {
+		if c.executor != nil {
+			if err := c.executor.RollbackActive(); err != nil && !c.quiet {
+				log.Printf("failed to roll back disconnected transaction: %v", err)
+			}
+		}
+		c.conn.Close()
+	}()
 
 	// First, check for SSL request (sent before startup message)
 	// SSL request is 8 bytes: length(4) + code(4) where code = 80877103
@@ -187,9 +212,20 @@ func (c *Connection) handleMessage(msg *Message) error {
 		log.Printf("Client requested termination")
 		return io.EOF
 
-	case MsgParse, MsgBind, MsgDescribe, MsgExecute, MsgSync, MsgClose:
-		// Extended query protocol - not implemented yet
-		c.sendError("ERROR", ErrCodeFeatureNotSupported, "Extended query protocol not yet supported")
+	case MsgParse:
+		return c.handleParse(msg)
+	case MsgBind:
+		return c.handleBind(msg)
+	case MsgDescribe:
+		return c.handleDescribe(msg)
+	case MsgExecute:
+		return c.handleExecute(msg)
+	case MsgClose:
+		return c.handleClose(msg)
+	case MsgFlush:
+		return c.writer.Flush()
+	case MsgSync:
+		c.extendedFailed = false
 		return c.sendReadyForQuery()
 
 	default:
@@ -219,46 +255,622 @@ func (c *Connection) handleQuery(msg *Message) error {
 
 	// Handle special PostgreSQL system queries that drivers send
 	sqlUpper := strings.ToUpper(strings.TrimSpace(sql))
+	singleStatement := isSingleStatementSQL(sql)
 
 	// lib/pq and other drivers query these for connection validation
-	if strings.Contains(sqlUpper, "SELECT VERSION()") {
+	if singleStatement && strings.Contains(sqlUpper, "SELECT VERSION()") {
 		// Return a fake PostgreSQL version
 		return c.handleVersionQuery()
 	}
 
-	if strings.Contains(sqlUpper, "SELECT CURRENT_USER") {
+	if singleStatement && strings.Contains(sqlUpper, "SELECT CURRENT_USER") {
 		// Return the current user
 		return c.handleCurrentUserQuery()
 	}
 
-	if strings.Contains(sqlUpper, "SHOW") && (strings.Contains(sqlUpper, "SERVER_VERSION") ||
+	if singleStatement && strings.Contains(sqlUpper, "SHOW") && (strings.Contains(sqlUpper, "SERVER_VERSION") ||
 		strings.Contains(sqlUpper, "SERVER_ENCODING") ||
 		strings.Contains(sqlUpper, "CLIENT_ENCODING")) {
 		// Handle SHOW commands
 		return c.handleShowCommand(sqlUpper)
 	}
+	if result, handled, err := c.catalogResult(sql); handled {
+		if err != nil {
+			c.sendError("ERROR", ErrCodeInternalError, err.Error())
+			return c.sendReadyForQuery()
+		}
+		if err := c.sendTabularResult(result, "SELECT"); err != nil {
+			return err
+		}
+		return c.sendReadyForQuery()
+	}
 
-	// Execute query
+	// Parse the complete batch before executing its first statement. This keeps
+	// unsupported trailing clauses from turning into committed writes.
 	l := lexer.New(sql)
 	p := parser.New(l)
-	stmt, err := p.Parse()
+	stmts, err := p.ParseMultiple()
 	if err != nil {
 		c.sendError("ERROR", ErrCodeSyntaxError, fmt.Sprintf("Syntax error: %v", err))
 		return c.sendReadyForQuery()
 	}
 
-	result, err := c.executor.Execute(stmt)
-	if err != nil {
-		c.sendError("ERROR", ErrCodeInternalError, fmt.Sprintf("Execution error: %v", err))
-		return c.sendReadyForQuery()
-	}
-
-	// Send result based on statement type
-	if err := c.sendResult(result, stmt); err != nil {
-		return err
+	for _, stmt := range stmts {
+		if c.txStatus == TxStatusFailed {
+			if _, rollback := stmt.(*parser.RollbackStmt); !rollback {
+				c.sendError("ERROR", ErrCodeTransactionAborted, "current transaction is aborted, commands ignored until end of transaction block")
+				return c.sendReadyForQuery()
+			}
+		}
+		result, err := c.executor.Execute(stmt)
+		if err != nil {
+			if c.txStatus == TxStatusInBlock {
+				c.txStatus = TxStatusFailed
+			}
+			c.sendError("ERROR", ErrCodeInternalError, fmt.Sprintf("Execution error: %v", err))
+			return c.sendReadyForQuery()
+		}
+		if err := c.sendResult(result, stmt); err != nil {
+			return err
+		}
 	}
 
 	return c.sendReadyForQuery()
+}
+
+func (c *Connection) handleParse(msg *Message) error {
+	if c.extendedFailed {
+		return nil
+	}
+	name, pos, err := readCString(msg.Data, 0)
+	if err != nil {
+		return c.failExtended(ErrCodeProtocolViolation, err)
+	}
+	query, pos, err := readCString(msg.Data, pos)
+	if err != nil || pos+2 > len(msg.Data) {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Parse message"))
+	}
+	count := int(binary.BigEndian.Uint16(msg.Data[pos : pos+2]))
+	pos += 2
+	if pos+count*4 != len(msg.Data) {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Parse parameter list"))
+	}
+	oids := make([]int32, count)
+	for i := range oids {
+		oids[i] = int32(binary.BigEndian.Uint32(msg.Data[pos : pos+4]))
+		pos += 4
+	}
+	c.statements[name] = &preparedStatement{query: query, paramOIDs: oids}
+	return c.writeMessage(MsgParseComplete, nil)
+}
+
+func (c *Connection) handleBind(msg *Message) error {
+	if c.extendedFailed {
+		return nil
+	}
+	portalName, pos, err := readCString(msg.Data, 0)
+	if err != nil {
+		return c.failExtended(ErrCodeProtocolViolation, err)
+	}
+	statementName, pos, err := readCString(msg.Data, pos)
+	if err != nil {
+		return c.failExtended(ErrCodeProtocolViolation, err)
+	}
+	statement, ok := c.statements[statementName]
+	if !ok {
+		return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("prepared statement %q does not exist", statementName))
+	}
+	formats, pos, err := readInt16List(msg.Data, pos)
+	if err != nil || pos+2 > len(msg.Data) {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Bind format list"))
+	}
+	paramCount := int(binary.BigEndian.Uint16(msg.Data[pos : pos+2]))
+	pos += 2
+	params := make([]boundParameter, paramCount)
+	for i := range params {
+		if pos+4 > len(msg.Data) {
+			return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Bind parameter"))
+		}
+		length := int32(binary.BigEndian.Uint32(msg.Data[pos : pos+4]))
+		pos += 4
+		params[i].oid = parameterOID(statement.paramOIDs, i)
+		params[i].format = parameterFormat(formats, i)
+		if length == -1 {
+			params[i].null = true
+			continue
+		}
+		if length < 0 || pos+int(length) > len(msg.Data) {
+			return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Bind parameter length"))
+		}
+		params[i].value = append([]byte(nil), msg.Data[pos:pos+int(length)]...)
+		pos += int(length)
+	}
+	_, pos, err = readInt16List(msg.Data, pos) // result formats; text output is currently used
+	if err != nil || pos != len(msg.Data) {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Bind result format list"))
+	}
+	query, err := bindQuery(statement.query, params)
+	if err != nil {
+		return c.failExtended(ErrCodeInvalidParameter, err)
+	}
+	c.portals[portalName] = &portal{query: query}
+	return c.writeMessage(MsgBindComplete, nil)
+}
+
+func (c *Connection) handleDescribe(msg *Message) error {
+	if c.extendedFailed {
+		return nil
+	}
+	if len(msg.Data) < 2 {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Describe message"))
+	}
+	name, pos, err := readCString(msg.Data, 1)
+	if err != nil || pos != len(msg.Data) {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Describe name"))
+	}
+	switch msg.Data[0] {
+	case 'S':
+		statement, ok := c.statements[name]
+		if !ok {
+			return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("prepared statement %q does not exist", name))
+		}
+		mb := NewMessageBuilder()
+		mb.WriteInt16(int16(len(statement.paramOIDs)))
+		for _, oid := range statement.paramOIDs {
+			mb.WriteInt32(oid)
+		}
+		if err := c.writeMessage(MsgParameterDescription, mb.Bytes()); err != nil {
+			return err
+		}
+	case 'P':
+		if _, ok := c.portals[name]; !ok {
+			return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("portal %q does not exist", name))
+		}
+	default:
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Describe target"))
+	}
+	// Execute sends the row description once the bound statement has been
+	// analyzed, avoiding side effects during Describe.
+	return c.writeMessage(MsgNoData, nil)
+}
+
+func (c *Connection) handleExecute(msg *Message) error {
+	if c.extendedFailed {
+		return nil
+	}
+	name, pos, err := readCString(msg.Data, 0)
+	if err != nil || pos+4 != len(msg.Data) {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Execute message"))
+	}
+	portal, ok := c.portals[name]
+	if !ok {
+		return c.failExtended(ErrCodeInvalidParameter, fmt.Errorf("portal %q does not exist", name))
+	}
+	if portal.executed {
+		return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("portal can only be executed once"))
+	}
+	portal.executed = true
+	if result, handled, catalogErr := c.catalogResult(portal.query); handled {
+		if catalogErr != nil {
+			return c.failExtended(ErrCodeInternalError, catalogErr)
+		}
+		return c.sendTabularResult(result, "SELECT")
+	}
+	l := lexer.New(portal.query)
+	stmt, err := parser.New(l).Parse()
+	if err != nil {
+		return c.failExtended(ErrCodeSyntaxError, fmt.Errorf("syntax error: %w", err))
+	}
+	if c.txStatus == TxStatusFailed {
+		if _, rollback := stmt.(*parser.RollbackStmt); !rollback {
+			return c.failExtended(ErrCodeTransactionAborted, fmt.Errorf("current transaction is aborted, commands ignored until end of transaction block"))
+		}
+	}
+	result, err := c.executor.Execute(stmt)
+	if err != nil {
+		if c.txStatus == TxStatusInBlock {
+			c.txStatus = TxStatusFailed
+		}
+		return c.failExtended(ErrCodeInternalError, fmt.Errorf("execution error: %w", err))
+	}
+	return c.sendResult(result, stmt)
+}
+
+var catalogFilterPattern = regexp.MustCompile(`(?i)\b(table_name|tablename|table_schema|schemaname|constraint_name|indexname)\s*=\s*'((?:''|[^'])*)'`)
+
+func (c *Connection) catalogResult(sql string) (*executor.Result, bool, error) {
+	if !isSingleStatementSQL(sql) {
+		return nil, false, nil
+	}
+	upper := strings.ToUpper(sql)
+	var source string
+	for _, candidate := range []string{
+		"INFORMATION_SCHEMA.TABLES", "INFORMATION_SCHEMA.COLUMNS",
+		"INFORMATION_SCHEMA.TABLE_CONSTRAINTS", "INFORMATION_SCHEMA.KEY_COLUMN_USAGE",
+		"PG_TABLES", "PG_INDEXES",
+	} {
+		if strings.Contains(upper, "FROM "+candidate) {
+			source = candidate
+			break
+		}
+	}
+	if source == "" {
+		return nil, false, nil
+	}
+	if c.txStatus == TxStatusIdle {
+		c.schema.LockStatement()
+		defer c.schema.UnlockStatement()
+	}
+
+	tables, err := c.schema.ListTables()
+	if err != nil {
+		return nil, true, err
+	}
+	rows := make([]map[string]interface{}, 0)
+	switch source {
+	case "INFORMATION_SCHEMA.TABLES":
+		for _, table := range tables {
+			rows = append(rows, map[string]interface{}{
+				"table_catalog": c.database, "table_schema": "public", "table_name": table, "table_type": "BASE TABLE",
+			})
+		}
+	case "PG_TABLES":
+		for _, table := range tables {
+			indexes, _ := c.schema.ListTableIndexes(table)
+			rows = append(rows, map[string]interface{}{
+				"schemaname": "public", "tablename": table, "tableowner": c.params["user"], "tablespace": nil,
+				"hasindexes": len(indexes) > 0, "hasrules": false, "hastriggers": false, "rowsecurity": false,
+			})
+		}
+	case "INFORMATION_SCHEMA.COLUMNS":
+		for _, table := range tables {
+			schema, schemaErr := c.schema.GetSchema(table)
+			if schemaErr != nil {
+				continue
+			}
+			for i, column := range schema.Columns {
+				rows = append(rows, map[string]interface{}{
+					"table_catalog": c.database, "table_schema": "public", "table_name": table,
+					"column_name": column.Name, "ordinal_position": int64(i + 1), "column_default": column.Default,
+					"is_nullable": yesNo(column.Nullable), "data_type": strings.ToLower(column.Type),
+				})
+			}
+		}
+	case "INFORMATION_SCHEMA.TABLE_CONSTRAINTS", "INFORMATION_SCHEMA.KEY_COLUMN_USAGE":
+		for _, table := range tables {
+			schema, schemaErr := c.schema.GetSchema(table)
+			if schemaErr != nil || schema.PrimaryKey == "" || schema.PrimaryKey == "_rowid_" {
+				continue
+			}
+			row := map[string]interface{}{
+				"constraint_catalog": c.database, "constraint_schema": "public", "constraint_name": table + "_pkey",
+				"table_catalog": c.database, "table_schema": "public", "table_name": table,
+			}
+			if source == "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" {
+				row["constraint_type"] = "PRIMARY KEY"
+				row["is_deferrable"] = "NO"
+				row["initially_deferred"] = "NO"
+			} else {
+				row["column_name"] = schema.PrimaryKey
+				row["ordinal_position"] = int64(1)
+			}
+			rows = append(rows, row)
+		}
+	case "PG_INDEXES":
+		for _, table := range tables {
+			indexes, _ := c.schema.ListTableIndexes(table)
+			for _, index := range indexes {
+				columns := make([]string, len(index.Columns))
+				for i, column := range index.Columns {
+					columns[i] = column.Name
+				}
+				unique := ""
+				if index.Unique {
+					unique = "UNIQUE "
+				}
+				rows = append(rows, map[string]interface{}{
+					"schemaname": "public", "tablename": table, "indexname": index.Name, "tablespace": nil,
+					"indexdef": fmt.Sprintf("CREATE %sINDEX %s ON %s (%s)", unique, index.Name, table, strings.Join(columns, ", ")),
+				})
+			}
+		}
+	}
+
+	for _, match := range catalogFilterPattern.FindAllStringSubmatch(sql, -1) {
+		column, expected := strings.ToLower(match[1]), strings.ReplaceAll(match[2], "''", "'")
+		filtered := rows[:0]
+		for _, row := range rows {
+			if value, ok := row[column]; ok && strings.EqualFold(fmt.Sprintf("%v", value), expected) {
+				filtered = append(filtered, row)
+			}
+		}
+		rows = filtered
+	}
+
+	columns := catalogProjection(sql, rows)
+	result := executor.NewResult("SELECT")
+	if len(columns) == 1 && columns[0] == "count(*)" {
+		result.AddColumnWithType("count", "INTEGER")
+		result.AddRow(int64(len(rows)))
+		return result, true, nil
+	}
+	for _, column := range columns {
+		columnType := "TEXT"
+		if column == "ordinal_position" {
+			columnType = "INTEGER"
+		} else if strings.HasPrefix(column, "has") || column == "rowsecurity" {
+			columnType = "BOOLEAN"
+		}
+		result.AddColumnWithType(column, columnType)
+	}
+	for _, row := range rows {
+		values := make([]interface{}, len(columns))
+		for i, column := range columns {
+			values[i] = row[column]
+		}
+		result.AddRow(values...)
+	}
+	return result, true, nil
+}
+
+func isSingleStatementSQL(sql string) bool {
+	trimmed := strings.TrimSpace(sql)
+	if strings.HasSuffix(trimmed, ";") {
+		trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, ";"))
+	}
+	inString, inIdent := false, false
+	for i := 0; i < len(trimmed); i++ {
+		switch trimmed[i] {
+		case '\'':
+			if !inIdent {
+				if inString && i+1 < len(trimmed) && trimmed[i+1] == '\'' {
+					i++
+					continue
+				}
+				inString = !inString
+			}
+		case '"':
+			if !inString {
+				inIdent = !inIdent
+			}
+		case ';':
+			if !inString && !inIdent {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func catalogProjection(sql string, rows []map[string]interface{}) []string {
+	upper := strings.ToUpper(sql)
+	selectPos, fromPos := strings.Index(upper, "SELECT"), strings.Index(upper, " FROM ")
+	if selectPos < 0 || fromPos < 0 || fromPos <= selectPos+6 {
+		return nil
+	}
+	projection := strings.TrimSpace(sql[selectPos+6 : fromPos])
+	projection = strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(projection), "DISTINCT "))
+	if projection == "*" && len(rows) > 0 {
+		columns := make([]string, 0, len(rows[0]))
+		for column := range rows[0] {
+			columns = append(columns, column)
+		}
+		sort.Strings(columns)
+		return columns
+	}
+	parts := strings.Split(projection, ",")
+	columns := make([]string, 0, len(parts))
+	for _, part := range parts {
+		column := strings.TrimSpace(part)
+		if index := strings.Index(strings.ToUpper(column), " AS "); index >= 0 {
+			column = strings.TrimSpace(column[:index])
+		}
+		if index := strings.LastIndex(column, "."); index >= 0 {
+			column = column[index+1:]
+		}
+		columns = append(columns, strings.ToLower(strings.Trim(column, `"`)))
+	}
+	return columns
+}
+
+func yesNo(value bool) string {
+	if value {
+		return "YES"
+	}
+	return "NO"
+}
+
+func (c *Connection) sendTabularResult(result *executor.Result, tag string) error {
+	if err := c.sendRowDescription(result.Columns, result.ColumnTypes); err != nil {
+		return err
+	}
+	for _, row := range result.Rows {
+		if err := c.sendDataRow(row, result.Columns); err != nil {
+			return err
+		}
+	}
+	return c.sendCommandComplete(fmt.Sprintf("%s %d", tag, len(result.Rows)))
+}
+
+func (c *Connection) handleClose(msg *Message) error {
+	if c.extendedFailed {
+		return nil
+	}
+	if len(msg.Data) < 2 {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Close message"))
+	}
+	name, pos, err := readCString(msg.Data, 1)
+	if err != nil || pos != len(msg.Data) {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Close name"))
+	}
+	if msg.Data[0] == 'S' {
+		delete(c.statements, name)
+	} else if msg.Data[0] == 'P' {
+		delete(c.portals, name)
+	} else {
+		return c.failExtended(ErrCodeProtocolViolation, fmt.Errorf("invalid Close target"))
+	}
+	return c.writeMessage(MsgCloseComplete, nil)
+}
+
+func (c *Connection) failExtended(code string, err error) error {
+	c.extendedFailed = true
+	return c.sendError("ERROR", code, err.Error())
+}
+
+type boundParameter struct {
+	value  []byte
+	oid    int32
+	format int16
+	null   bool
+}
+
+func readCString(data []byte, pos int) (string, int, error) {
+	if pos < 0 || pos >= len(data) {
+		return "", pos, fmt.Errorf("missing null-terminated string")
+	}
+	end := bytes.IndexByte(data[pos:], 0)
+	if end < 0 {
+		return "", pos, fmt.Errorf("unterminated string")
+	}
+	return string(data[pos : pos+end]), pos + end + 1, nil
+}
+
+func readInt16List(data []byte, pos int) ([]int16, int, error) {
+	if pos+2 > len(data) {
+		return nil, pos, fmt.Errorf("missing list length")
+	}
+	count := int(binary.BigEndian.Uint16(data[pos : pos+2]))
+	pos += 2
+	if pos+count*2 > len(data) {
+		return nil, pos, fmt.Errorf("truncated list")
+	}
+	result := make([]int16, count)
+	for i := range result {
+		result[i] = int16(binary.BigEndian.Uint16(data[pos : pos+2]))
+		pos += 2
+	}
+	return result, pos, nil
+}
+
+func parameterOID(oids []int32, index int) int32 {
+	if index < len(oids) {
+		return oids[index]
+	}
+	return 0
+}
+
+func parameterFormat(formats []int16, index int) int16 {
+	if len(formats) == 1 {
+		return formats[0]
+	}
+	if index < len(formats) {
+		return formats[index]
+	}
+	return 0
+}
+
+func bindQuery(query string, params []boundParameter) (string, error) {
+	var result strings.Builder
+	inString, inIdent := false, false
+	for i := 0; i < len(query); {
+		ch := query[i]
+		if ch == '\'' && !inIdent {
+			result.WriteByte(ch)
+			if inString && i+1 < len(query) && query[i+1] == '\'' {
+				result.WriteByte(query[i+1])
+				i += 2
+				continue
+			}
+			inString = !inString
+			i++
+			continue
+		}
+		if ch == '"' && !inString {
+			inIdent = !inIdent
+			result.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == '$' && !inString && !inIdent && i+1 < len(query) && query[i+1] >= '0' && query[i+1] <= '9' {
+			end := i + 1
+			for end < len(query) && query[end] >= '0' && query[end] <= '9' {
+				end++
+			}
+			n, _ := strconv.Atoi(query[i+1 : end])
+			if n < 1 || n > len(params) {
+				return "", fmt.Errorf("parameter $%d was not provided", n)
+			}
+			literal, err := parameterLiteral(params[n-1])
+			if err != nil {
+				return "", fmt.Errorf("parameter $%d: %w", n, err)
+			}
+			result.WriteString(literal)
+			i = end
+			continue
+		}
+		result.WriteByte(ch)
+		i++
+	}
+	return result.String(), nil
+}
+
+func parameterLiteral(param boundParameter) (string, error) {
+	if param.null {
+		return "NULL", nil
+	}
+	if param.format == 1 {
+		switch param.oid {
+		case 16:
+			if len(param.value) != 1 {
+				return "", fmt.Errorf("invalid binary boolean")
+			}
+			if param.value[0] == 0 {
+				return "FALSE", nil
+			}
+			return "TRUE", nil
+		case 21:
+			if len(param.value) != 2 {
+				return "", fmt.Errorf("invalid binary int2")
+			}
+			return strconv.FormatInt(int64(int16(binary.BigEndian.Uint16(param.value))), 10), nil
+		case 23:
+			if len(param.value) != 4 {
+				return "", fmt.Errorf("invalid binary int4")
+			}
+			return strconv.FormatInt(int64(int32(binary.BigEndian.Uint32(param.value))), 10), nil
+		case 20:
+			if len(param.value) != 8 {
+				return "", fmt.Errorf("invalid binary int8")
+			}
+			return strconv.FormatInt(int64(binary.BigEndian.Uint64(param.value)), 10), nil
+		default:
+			return "", fmt.Errorf("binary format is unsupported for OID %d", param.oid)
+		}
+	}
+	value := string(param.value)
+	switch param.oid {
+	case 0:
+		if strings.EqualFold(value, "true") || strings.EqualFold(value, "false") {
+			return strings.ToUpper(value), nil
+		}
+		if _, err := strconv.ParseFloat(value, 64); err == nil && value != "" {
+			return value, nil
+		}
+		return "'" + strings.ReplaceAll(value, "'", "''") + "'", nil
+	case 16:
+		if strings.EqualFold(value, "true") || value == "1" || value == "t" {
+			return "TRUE", nil
+		}
+		return "FALSE", nil
+	case 20, 21, 23, 26, 700, 701, 1700:
+		if _, err := strconv.ParseFloat(value, 64); err != nil {
+			return "", fmt.Errorf("invalid numeric value")
+		}
+		return value, nil
+	default:
+		return "'" + strings.ReplaceAll(value, "'", "''") + "'", nil
+	}
 }
 
 // sendResult sends query results
@@ -298,6 +910,8 @@ func (c *Connection) getCommandTag(stmt parser.Statement, result *executor.Resul
 		return "CREATE INDEX"
 	case *parser.DropIndexStmt:
 		return "DROP INDEX"
+	case *parser.AlterTableStmt:
+		return "ALTER TABLE"
 	case *parser.InsertStmt:
 		return fmt.Sprintf("INSERT 0 %d", result.RowsAffected)
 	case *parser.UpdateStmt:
@@ -344,7 +958,7 @@ func (c *Connection) sendBackendKeyData(processID, secretKey int32) error {
 // sendReadyForQuery sends ready for query message
 func (c *Connection) sendReadyForQuery() error {
 	mb := NewMessageBuilder()
-	mb.WriteByte(c.txStatus)
+	mb.AppendByte(c.txStatus)
 	return c.writeMessage(MsgReadyForQuery, mb.Bytes())
 }
 
@@ -405,13 +1019,13 @@ func (c *Connection) sendCommandComplete(tag string) error {
 // sendError sends an error response
 func (c *Connection) sendError(severity, code, message string) error {
 	mb := NewMessageBuilder()
-	mb.WriteByte(ErrorFieldSeverity)
+	mb.AppendByte(ErrorFieldSeverity)
 	mb.WriteString(severity)
-	mb.WriteByte(ErrorFieldCode)
+	mb.AppendByte(ErrorFieldCode)
 	mb.WriteString(code)
-	mb.WriteByte(ErrorFieldMessage)
+	mb.AppendByte(ErrorFieldMessage)
 	mb.WriteString(message)
-	mb.WriteByte(0) // Terminator
+	mb.AppendByte(0) // Terminator
 
 	return c.writeMessage(MsgErrorResponse, mb.Bytes())
 }
