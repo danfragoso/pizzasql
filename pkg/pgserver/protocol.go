@@ -6,6 +6,15 @@ import (
 	"io"
 )
 
+// Maximum message sizes enforced before any allocation, to bound memory use
+// against malformed or hostile clients. Regular protocol messages (queries,
+// bind parameters, etc.) are capped at 16 MiB; startup messages are much
+// smaller and capped at 1 MiB.
+const (
+	MaxMessageSize        = 16 * 1024 * 1024 // 16 MiB
+	MaxStartupMessageSize = 1 * 1024 * 1024  // 1 MiB
+)
+
 // Message type constants (first byte of message)
 const (
 	// Frontend (client) messages
@@ -128,6 +137,9 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	if length < 4 {
 		return nil, fmt.Errorf("invalid message length: %d", length)
 	}
+	if length > MaxMessageSize {
+		return nil, fmt.Errorf("message length %d exceeds maximum %d", length, MaxMessageSize)
+	}
 
 	// Read message data
 	data := make([]byte, length-4)
@@ -151,6 +163,9 @@ func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 
 	if length < 8 {
 		return nil, fmt.Errorf("invalid startup message length: %d", length)
+	}
+	if length > MaxStartupMessageSize {
+		return nil, fmt.Errorf("startup message length %d exceeds maximum %d", length, MaxStartupMessageSize)
 	}
 
 	// Read protocol version

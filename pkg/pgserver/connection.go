@@ -237,7 +237,11 @@ func (c *Connection) handleMessage(msg *Message) error {
 
 // handleQuery processes a simple query
 func (c *Connection) handleQuery(msg *Message) error {
-	// Parse query string (null-terminated)
+	// A Query message carries a single NUL-terminated query string.
+	if len(msg.Data) == 0 || msg.Data[len(msg.Data)-1] != 0 {
+		c.sendError("ERROR", ErrCodeProtocolViolation, "invalid Query message: missing null terminator")
+		return c.sendReadyForQuery()
+	}
 	sql := string(msg.Data[:len(msg.Data)-1])
 
 	if !c.quiet {
@@ -256,6 +260,15 @@ func (c *Connection) handleQuery(msg *Message) error {
 	// Handle special PostgreSQL system queries that drivers send
 	sqlUpper := strings.ToUpper(strings.TrimSpace(sql))
 	singleStatement := isSingleStatementSQL(sql)
+
+	// In a failed transaction only ROLLBACK (or ROLLBACK TO SAVEPOINT) is
+	// accepted. Gate before honoring the special driver queries below so they
+	// return 25P02 instead of a result. Multi-statement batches are gated
+	// per statement in the execution loop below.
+	if c.txStatus == TxStatusFailed && singleStatement && !isRollbackStatement(sql) {
+		c.sendError("ERROR", ErrCodeTransactionAborted, "current transaction is aborted, commands ignored until end of transaction block")
+		return c.sendReadyForQuery()
+	}
 
 	// lib/pq and other drivers query these for connection validation
 	if singleStatement && strings.Contains(sqlUpper, "SELECT VERSION()") {
@@ -450,6 +463,12 @@ func (c *Connection) handleExecute(msg *Message) error {
 		return c.failExtended(ErrCodeFeatureNotSupported, fmt.Errorf("portal can only be executed once"))
 	}
 	portal.executed = true
+	// Check the transaction state before catalog emulation. Catalog queries do
+	// not all parse as regular PizzaSQL statements, but must still return 25P02
+	// while the transaction is aborted.
+	if c.txStatus == TxStatusFailed && !isRollbackStatement(portal.query) {
+		return c.failExtended(ErrCodeTransactionAborted, fmt.Errorf("current transaction is aborted, commands ignored until end of transaction block"))
+	}
 	if result, handled, catalogErr := c.catalogResult(portal.query); handled {
 		if catalogErr != nil {
 			return c.failExtended(ErrCodeInternalError, catalogErr)
@@ -460,11 +479,6 @@ func (c *Connection) handleExecute(msg *Message) error {
 	stmt, err := parser.New(l).Parse()
 	if err != nil {
 		return c.failExtended(ErrCodeSyntaxError, fmt.Errorf("syntax error: %w", err))
-	}
-	if c.txStatus == TxStatusFailed {
-		if _, rollback := stmt.(*parser.RollbackStmt); !rollback {
-			return c.failExtended(ErrCodeTransactionAborted, fmt.Errorf("current transaction is aborted, commands ignored until end of transaction block"))
-		}
 	}
 	result, err := c.executor.Execute(stmt)
 	if err != nil {
@@ -640,6 +654,17 @@ func isSingleStatementSQL(sql string) bool {
 		}
 	}
 	return true
+}
+
+// isRollbackStatement reports whether sql parses as a single ROLLBACK
+// statement, including ROLLBACK TO SAVEPOINT.
+func isRollbackStatement(sql string) bool {
+	stmt, err := parser.New(lexer.New(sql)).Parse()
+	if err != nil {
+		return false
+	}
+	_, ok := stmt.(*parser.RollbackStmt)
+	return ok
 }
 
 func catalogProjection(sql string, rows []map[string]interface{}) []string {
@@ -901,7 +926,7 @@ func (c *Connection) sendResult(result *executor.Result, stmt parser.Statement) 
 
 // getCommandTag returns the command completion tag
 func (c *Connection) getCommandTag(stmt parser.Statement, result *executor.Result) string {
-	switch stmt.(type) {
+	switch s := stmt.(type) {
 	case *parser.CreateTableStmt:
 		return "CREATE TABLE"
 	case *parser.DropTableStmt:
@@ -925,8 +950,18 @@ func (c *Connection) getCommandTag(stmt parser.Statement, result *executor.Resul
 		c.txStatus = TxStatusIdle
 		return "COMMIT"
 	case *parser.RollbackStmt:
+		if s.Savepoint != "" {
+			c.txStatus = TxStatusInBlock
+			return "ROLLBACK"
+		}
 		c.txStatus = TxStatusIdle
 		return "ROLLBACK"
+	case *parser.SavepointStmt:
+		c.txStatus = TxStatusInBlock
+		return "SAVEPOINT"
+	case *parser.ReleaseStmt:
+		c.txStatus = TxStatusInBlock
+		return "RELEASE"
 	default:
 		return "OK"
 	}
