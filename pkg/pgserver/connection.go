@@ -994,7 +994,13 @@ func (c *Connection) sendBackendKeyData(processID, secretKey int32) error {
 func (c *Connection) sendReadyForQuery() error {
 	mb := NewMessageBuilder()
 	mb.AppendByte(c.txStatus)
-	return c.writeMessage(MsgReadyForQuery, mb.Bytes())
+	if err := c.writeMessage(MsgReadyForQuery, mb.Bytes()); err != nil {
+		return err
+	}
+	// ReadyForQuery closes out a response cycle, so flush everything buffered
+	// so far. This is what makes simple-query results and Sync responses
+	// visible to the client.
+	return c.writer.Flush()
 }
 
 // sendEmptyQueryResponse sends empty query response
@@ -1062,18 +1068,25 @@ func (c *Connection) sendError(severity, code, message string) error {
 	mb.WriteString(message)
 	mb.AppendByte(0) // Terminator
 
-	return c.writeMessage(MsgErrorResponse, mb.Bytes())
+	if err := c.writeMessage(MsgErrorResponse, mb.Bytes()); err != nil {
+		return err
+	}
+	// Errors must be visible promptly, including FATAL startup failures that
+	// are not followed by a ReadyForQuery before the connection closes.
+	return c.writer.Flush()
 }
 
-// writeMessage writes a message to the connection
+// writeMessage buffers a message for the connection. It does not flush, so
+// callers that need to make a response visible to the client must flush at the
+// appropriate protocol boundary (ReadyForQuery, an explicit Flush message, or
+// an error response). Buffering amortizes the per-message syscalls that a
+// result set would otherwise incur; the underlying bufio.Writer bounds memory
+// use so large result sets cannot grow the buffer without limit.
 func (c *Connection) writeMessage(msgType byte, data []byte) error {
 	if !c.quiet {
 		log.Printf("Sending message type=%c length=%d", msgType, len(data)+4)
 	}
-	if err := WriteMessage(c.writer, msgType, data); err != nil {
-		return err
-	}
-	return c.writer.Flush()
+	return WriteMessage(c.writer, msgType, data)
 }
 
 // getOIDForType returns PostgreSQL OID for type

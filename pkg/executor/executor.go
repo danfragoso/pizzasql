@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"container/heap"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -244,6 +245,44 @@ func isCatalogMiss(err error) bool {
 		analysisErr.Type == analyzer.ErrColumnNotFound
 }
 
+// isCountStarSingleTable reports whether the statement is the safe COUNT(*)
+// shape eligible for the metadata fast path: a single-table SELECT with exactly
+// one COUNT(*) column and no filters, grouping, DISTINCT, JOIN, subquery, or
+// LIMIT/OFFSET. Anything else returns false so unsupported shapes use the
+// normal scan path.
+func isCountStarSingleTable(stmt *parser.SelectStmt) bool {
+	if stmt.Compound != nil || stmt.Distinct {
+		return false
+	}
+	if stmt.Where != nil || stmt.Having != nil {
+		return false
+	}
+	if len(stmt.GroupBy) > 0 || len(stmt.OrderBy) > 0 {
+		return false
+	}
+	if stmt.Limit != nil || stmt.Offset != nil {
+		return false
+	}
+	if len(stmt.From) != 1 {
+		return false
+	}
+	ref := stmt.From[0]
+	if ref.Subquery != nil || ref.Join != nil {
+		return false
+	}
+	if len(stmt.Columns) != 1 || stmt.Columns[0].Star {
+		return false
+	}
+	fn, ok := stmt.Columns[0].Expr.(*parser.FunctionCall)
+	if !ok {
+		return false
+	}
+	if !strings.EqualFold(fn.Name, "count") || !fn.Star || len(fn.Args) > 0 {
+		return false
+	}
+	return true
+}
+
 // executeSelect executes a SELECT statement (or compound SELECT).
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	if stmt.Compound != nil {
@@ -278,6 +317,24 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 	schema, err := e.schema.GetSchema(tableName)
 	if err != nil {
 		return nil, err
+	}
+
+	// COUNT(*) fast path: exact metadata-based count for the safe single-table
+	// shape with no filters/grouping/distinct/join. Any unsupported shape falls
+	// through to the normal scan path.
+	if isCountStarSingleTable(stmt) {
+		count, err := e.table.CountFast(tableName)
+		if err != nil {
+			return nil, err
+		}
+		result := NewResult("SELECT")
+		if stmt.Columns[0].Alias != "" {
+			result.AddColumn(stmt.Columns[0].Alias)
+		} else {
+			result.AddColumn("column1")
+		}
+		result.AddRow(int64(count))
+		return result, nil
 	}
 
 	// Multi-table FROM (comma-separated implicit cross join): collect and cross join all tables,
@@ -999,26 +1056,8 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return e.executeAggregateSelect(stmt, rows, schema)
 	}
 
-	// Apply ORDER BY
-	if len(stmt.OrderBy) > 0 {
-		e.sortRows(rows, resolveOrderByPositions(stmt.OrderBy, stmt.Columns))
-	}
-
-	// Apply LIMIT/OFFSET
-	if stmt.Offset != nil {
-		offset := e.evalIntExpr(stmt.Offset)
-		if offset < len(rows) {
-			rows = rows[offset:]
-		} else {
-			rows = nil
-		}
-	}
-	if stmt.Limit != nil {
-		limit := e.evalIntExpr(stmt.Limit)
-		if limit < len(rows) {
-			rows = rows[:limit]
-		}
-	}
+	// Apply ORDER BY, LIMIT, and OFFSET.
+	rows = e.orderAndLimitRows(rows, stmt.OrderBy, stmt.Limit, stmt.Offset, stmt.Columns)
 
 	// Build result
 	result := NewResult("SELECT")
@@ -1318,26 +1357,8 @@ func (e *Executor) executeSelectFromSubquery(stmt *parser.SelectStmt) (*Result, 
 		return e.executeAggregateSelect(stmt, derivedRows, tempSchema)
 	}
 
-	// Apply ORDER BY
-	if len(stmt.OrderBy) > 0 {
-		e.sortRows(derivedRows, resolveOrderByPositions(stmt.OrderBy, stmt.Columns))
-	}
-
-	// Apply LIMIT/OFFSET
-	if stmt.Offset != nil {
-		offset := e.evalIntExpr(stmt.Offset)
-		if offset < len(derivedRows) {
-			derivedRows = derivedRows[offset:]
-		} else {
-			derivedRows = nil
-		}
-	}
-	if stmt.Limit != nil {
-		limit := e.evalIntExpr(stmt.Limit)
-		if limit < len(derivedRows) {
-			derivedRows = derivedRows[:limit]
-		}
-	}
+	// Apply ORDER BY, LIMIT, and OFFSET.
+	derivedRows = e.orderAndLimitRows(derivedRows, stmt.OrderBy, stmt.Limit, stmt.Offset, stmt.Columns)
 
 	// Build result
 	result := NewResult("SELECT")
@@ -1701,25 +1722,7 @@ func (e *Executor) finalizeGroupResult(stmt *parser.SelectStmt, result *Result, 
 	if stmt.Distinct {
 		result.Rows = e.applyDistinct(result.Rows)
 	}
-	if len(stmt.OrderBy) > 0 {
-		e.sortResultRows(result, stmt.OrderBy, expandedColumns, columnNames)
-	}
-	if stmt.Offset != nil {
-		offset := e.evalIntExpr(stmt.Offset)
-		if offset < len(result.Rows) {
-			result.Rows = result.Rows[offset:]
-		} else {
-			result.Rows = nil
-		}
-		result.RowCount = len(result.Rows)
-	}
-	if stmt.Limit != nil {
-		limit := e.evalIntExpr(stmt.Limit)
-		if limit < len(result.Rows) {
-			result.Rows = result.Rows[:limit]
-		}
-		result.RowCount = len(result.Rows)
-	}
+	e.orderAndLimitResultRows(result, stmt.OrderBy, stmt.Limit, stmt.Offset, expandedColumns, columnNames)
 	return result, nil
 }
 
@@ -4970,64 +4973,254 @@ func resolveOrderByPositions(orderBy []parser.OrderByItem, selectCols []parser.S
 	return result
 }
 
+// orderByLess reports whether key slice a sorts before b under orderBy.
+// Keys are precomputed per-row ORDER BY expression values, one per item.
+func orderByLess(a, b []interface{}, orderBy []parser.OrderByItem) bool {
+	for i, item := range orderBy {
+		cmp := compare(a[i], b[i])
+		if cmp != 0 {
+			if item.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+	}
+	return false
+}
+
+// sortKeyOrder returns a permutation of [0..len(keys)) that sorts the keys
+// ascending per orderBy.
+func sortKeyOrder(keys [][]interface{}, orderBy []parser.OrderByItem) []int {
+	order := make([]int, len(keys))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool {
+		return orderByLess(keys[order[a]], keys[order[b]], orderBy)
+	})
+	return order
+}
+
+// topNHeap is a bounded max-heap that keeps the k smallest elements (per
+// orderByLess) seen so far.
+type topNHeap struct {
+	keys    [][]interface{}
+	idx     []int
+	orderBy []parser.OrderByItem
+}
+
+func (h *topNHeap) Len() int { return len(h.idx) }
+
+func (h *topNHeap) Less(i, j int) bool {
+	return orderByLess(h.keys[h.idx[j]], h.keys[h.idx[i]], h.orderBy)
+}
+
+func (h *topNHeap) Swap(i, j int) { h.idx[i], h.idx[j] = h.idx[j], h.idx[i] }
+
+func (h *topNHeap) Push(x interface{}) { h.idx = append(h.idx, x.(int)) }
+
+func (h *topNHeap) Pop() interface{} {
+	n := len(h.idx)
+	x := h.idx[n-1]
+	h.idx = h.idx[:n-1]
+	return x
+}
+
+// topNKeyOrder returns the indices of the k smallest keys (per orderByLess) in
+// ascending order, without fully sorting all n elements. If k >= n it falls
+// back to a full sort.
+func topNKeyOrder(keys [][]interface{}, orderBy []parser.OrderByItem, k int) []int {
+	if k <= 0 {
+		return nil
+	}
+	if k >= len(keys) {
+		return sortKeyOrder(keys, orderBy)
+	}
+	h := &topNHeap{keys: keys, orderBy: orderBy, idx: make([]int, 0, k)}
+	for i := range keys {
+		if h.Len() < k {
+			heap.Push(h, i)
+		} else if orderByLess(keys[i], keys[h.idx[0]], orderBy) {
+			h.idx[0] = i
+			heap.Fix(h, 0)
+		}
+	}
+	selected := append([]int(nil), h.idx...)
+	sort.Slice(selected, func(a, b int) bool {
+		return orderByLess(keys[selected[a]], keys[selected[b]], orderBy)
+	})
+	return selected
+}
+
+func reorderRows(rows []storage.Row, order []int) {
+	tmp := make([]storage.Row, len(rows))
+	for i, idx := range order {
+		tmp[i] = rows[idx]
+	}
+	copy(rows, tmp)
+}
+
+// sortRowKeys precomputes the ORDER BY expression value for each row so each
+// expression is evaluated once per row instead of O(n log n) times.
+func (e *Executor) sortRowKeys(rows []storage.Row, orderBy []parser.OrderByItem) [][]interface{} {
+	keys := make([][]interface{}, len(rows))
+	for i, row := range rows {
+		ks := make([]interface{}, len(orderBy))
+		for j, item := range orderBy {
+			ks[j], _ = e.evalExpr(item.Expr, row)
+		}
+		keys[i] = ks
+	}
+	return keys
+}
+
 func (e *Executor) sortRows(rows []storage.Row, orderBy []parser.OrderByItem) {
-	sort.Slice(rows, func(i, j int) bool {
-		for _, item := range orderBy {
-			vi, _ := e.evalExpr(item.Expr, rows[i])
-			vj, _ := e.evalExpr(item.Expr, rows[j])
-			cmp := compare(vi, vj)
-			if cmp != 0 {
-				if item.Desc {
-					return cmp > 0
+	order := sortKeyOrder(e.sortRowKeys(rows, orderBy), orderBy)
+	reorderRows(rows, order)
+}
+
+// topNRows sorts only enough to keep the k smallest rows (per orderBy).
+func (e *Executor) topNRows(rows []storage.Row, orderBy []parser.OrderByItem, k int) []storage.Row {
+	order := topNKeyOrder(e.sortRowKeys(rows, orderBy), orderBy, k)
+	out := make([]storage.Row, len(order))
+	for i, idx := range order {
+		out[i] = rows[idx]
+	}
+	return out
+}
+
+// orderAndLimitRows applies ORDER BY (with a bounded top-N selection when a
+// LIMIT is present), then OFFSET and LIMIT, preserving SQL semantics.
+func (e *Executor) orderAndLimitRows(rows []storage.Row, orderBy []parser.OrderByItem, limitExpr, offsetExpr parser.Expr, selectCols []parser.SelectColumn) []storage.Row {
+	orderBy = resolveOrderByPositions(orderBy, selectCols)
+
+	var offset, limit int
+	hasOffset := offsetExpr != nil
+	hasLimit := limitExpr != nil
+	if hasOffset {
+		offset = e.evalIntExpr(offsetExpr)
+	}
+	if hasLimit {
+		limit = e.evalIntExpr(limitExpr)
+	}
+
+	if len(orderBy) > 0 {
+		if hasLimit && limit >= 0 {
+			k := offset + limit
+			if k >= 0 && k < len(rows) {
+				rows = e.topNRows(rows, orderBy, k)
+			} else {
+				e.sortRows(rows, orderBy)
+			}
+		} else {
+			e.sortRows(rows, orderBy)
+		}
+	}
+
+	if hasOffset {
+		if offset < len(rows) {
+			rows = rows[offset:]
+		} else {
+			rows = nil
+		}
+	}
+	if hasLimit {
+		if limit < len(rows) {
+			rows = rows[:limit]
+		}
+	}
+	return rows
+}
+
+// resultRowKey evaluates a single ORDER BY item against a result row, honoring
+// select-column aliases exactly like the previous sortResultRows implementation.
+func (e *Executor) resultRowKey(result *Result, rowIdx int, item parser.OrderByItem, columnNames []string) interface{} {
+	if ref, ok := item.Expr.(*parser.ColumnRef); ok && ref.Table == "" {
+		for idx, name := range columnNames {
+			if strings.EqualFold(name, ref.Column) {
+				if idx < len(result.Rows[rowIdx]) {
+					return result.Rows[rowIdx][idx]
 				}
-				return cmp < 0
 			}
 		}
-		return false
-	})
+	}
+	row := e.resultRowToStorageRow(result, rowIdx)
+	v, _ := e.evalExpr(item.Expr, row)
+	return v
+}
+
+// resultRowKeys precomputes the ORDER BY expression value for each result row.
+func (e *Executor) resultRowKeys(result *Result, orderBy []parser.OrderByItem, columnNames []string) [][]interface{} {
+	keys := make([][]interface{}, len(result.Rows))
+	for i := range result.Rows {
+		ks := make([]interface{}, len(orderBy))
+		for j, item := range orderBy {
+			ks[j] = e.resultRowKey(result, i, item, columnNames)
+		}
+		keys[i] = ks
+	}
+	return keys
 }
 
 // sortResultRows sorts Result.Rows based on ORDER BY clauses.
 // It handles column aliases by matching them against the select columns.
 func (e *Executor) sortResultRows(result *Result, orderBy []parser.OrderByItem, selectColumns []parser.SelectColumn, columnNames []string) {
 	orderBy = resolveOrderByPositions(orderBy, selectColumns)
-	sort.Slice(result.Rows, func(i, j int) bool {
-		for _, item := range orderBy {
-			var vi, vj interface{}
-			var rowI, rowJ storage.Row
+	order := sortKeyOrder(e.resultRowKeys(result, orderBy, columnNames), orderBy)
+	rows := make([][]interface{}, len(order))
+	for i, idx := range order {
+		rows[i] = result.Rows[idx]
+	}
+	result.Rows = rows
+}
 
-			// Check if ORDER BY references a column alias
-			if ref, ok := item.Expr.(*parser.ColumnRef); ok && ref.Table == "" {
-				// Look for matching alias in select columns
-				for idx, name := range columnNames {
-					if strings.EqualFold(name, ref.Column) {
-						if idx < len(result.Rows[i]) {
-							vi = result.Rows[i][idx]
-							vj = result.Rows[j][idx]
-							goto compare
-						}
-					}
+// orderAndLimitResultRows applies ORDER BY (with bounded top-N selection when a
+// LIMIT is present), then OFFSET and LIMIT, to a Result's rows.
+func (e *Executor) orderAndLimitResultRows(result *Result, orderBy []parser.OrderByItem, limitExpr, offsetExpr parser.Expr, selectCols []parser.SelectColumn, columnNames []string) {
+	orderBy = resolveOrderByPositions(orderBy, selectCols)
+
+	var offset, limit int
+	hasOffset := offsetExpr != nil
+	hasLimit := limitExpr != nil
+	if hasOffset {
+		offset = e.evalIntExpr(offsetExpr)
+	}
+	if hasLimit {
+		limit = e.evalIntExpr(limitExpr)
+	}
+
+	if len(orderBy) > 0 {
+		if hasLimit && limit >= 0 {
+			k := offset + limit
+			if k >= 0 && k < len(result.Rows) {
+				order := topNKeyOrder(e.resultRowKeys(result, orderBy, columnNames), orderBy, k)
+				rows := make([][]interface{}, len(order))
+				for i, idx := range order {
+					rows[i] = result.Rows[idx]
 				}
+				result.Rows = rows
+			} else {
+				e.sortResultRows(result, orderBy, nil, columnNames)
 			}
-
-			// If not found as alias, try to evaluate the expression
-			// Create temporary rows from result rows for evaluation
-			rowI = e.resultRowToStorageRow(result, i)
-			rowJ = e.resultRowToStorageRow(result, j)
-			vi, _ = e.evalExpr(item.Expr, rowI)
-			vj, _ = e.evalExpr(item.Expr, rowJ)
-
-		compare:
-			cmp := compare(vi, vj)
-			if cmp != 0 {
-				if item.Desc {
-					return cmp > 0
-				}
-				return cmp < 0
-			}
+		} else {
+			e.sortResultRows(result, orderBy, nil, columnNames)
 		}
-		return false
-	})
+	}
+
+	if hasOffset {
+		if offset < len(result.Rows) {
+			result.Rows = result.Rows[offset:]
+		} else {
+			result.Rows = nil
+		}
+		result.RowCount = len(result.Rows)
+	}
+	if hasLimit {
+		if limit < len(result.Rows) {
+			result.Rows = result.Rows[:limit]
+		}
+		result.RowCount = len(result.Rows)
+	}
 }
 
 // resultRowToStorageRow converts a Result row back to storage.Row for expression evaluation.

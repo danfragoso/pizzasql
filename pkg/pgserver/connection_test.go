@@ -3,8 +3,11 @@ package pgserver
 import (
 	"bufio"
 	"bytes"
+	"io"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/danfragoso/pizzasql-next/pkg/executor"
 	"github.com/danfragoso/pizzasql-next/pkg/lexer"
@@ -228,5 +231,146 @@ func TestIsRollbackStatement(t *testing.T) {
 		if isRollbackStatement(sql) {
 			t.Errorf("isRollbackStatement(%q) = true, want false", sql)
 		}
+	}
+}
+
+// countingConn is an in-memory net.Conn that records how many times the
+// underlying stream is written. bufio.Writer flushes produce exactly one write
+// call each, so this counts flushes without blocking like net.Pipe does.
+type countingConn struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	writes int
+}
+
+func (c *countingConn) Read(p []byte) (int, error) { return 0, io.EOF }
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes++
+	return c.buf.Write(p)
+}
+
+func (c *countingConn) Close() error                       { return nil }
+func (c *countingConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
+func (c *countingConn) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
+func (c *countingConn) SetDeadline(t time.Time) error      { return nil }
+func (c *countingConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *countingConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func (c *countingConn) bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.buf.Bytes()...)
+}
+
+func newCountingTestConnection(t *testing.T) (*Connection, *countingConn) {
+	t.Helper()
+	cc := &countingConn{}
+	c := &Connection{
+		conn:       cc,
+		reader:     bufio.NewReader(cc),
+		writer:     bufio.NewWriter(cc),
+		params:     map[string]string{"user": "tester"},
+		statements: make(map[string]*preparedStatement),
+		portals:    make(map[string]*portal),
+		txStatus:   TxStatusIdle,
+		quiet:      true,
+	}
+	return c, cc
+}
+
+func readAllMessages(t *testing.T, data []byte) []*Message {
+	t.Helper()
+	r := bytes.NewReader(data)
+	var msgs []*Message
+	for r.Len() > 0 {
+		m, err := ReadMessage(r)
+		if err != nil {
+			t.Fatalf("read message: %v", err)
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs
+}
+
+func TestWriteMessageDoesNotFlush(t *testing.T) {
+	c, cc := newCountingTestConnection(t)
+	if err := c.writeMessage(MsgCommandComplete, []byte("SELECT 0")); err != nil {
+		t.Fatal(err)
+	}
+	if cc.writes != 0 {
+		t.Fatalf("writeMessage flushed %d times, want 0", cc.writes)
+	}
+}
+
+func TestReadyForQueryFlushesBufferedMessages(t *testing.T) {
+	c, cc := newCountingTestConnection(t)
+	if err := c.writeMessage(MsgCommandComplete, []byte("SELECT 1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.sendReadyForQuery(); err != nil {
+		t.Fatal(err)
+	}
+	if cc.writes == 0 {
+		t.Fatal("sendReadyForQuery did not flush buffered messages")
+	}
+	msgs := readAllMessages(t, cc.bytes())
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2", len(msgs))
+	}
+	if msgs[0].Type != MsgCommandComplete || msgs[1].Type != MsgReadyForQuery {
+		t.Fatalf("unexpected message sequence: %c, %c", msgs[0].Type, msgs[1].Type)
+	}
+}
+
+func TestErrorResponseFlushes(t *testing.T) {
+	c, cc := newCountingTestConnection(t)
+	if err := c.sendError("ERROR", ErrCodeSyntaxError, "boom"); err != nil {
+		t.Fatal(err)
+	}
+	if cc.writes == 0 {
+		t.Fatal("sendError did not flush")
+	}
+	msgs := readAllMessages(t, cc.bytes())
+	if len(msgs) != 1 || msgs[0].Type != MsgErrorResponse {
+		t.Fatalf("expected a single error response, got %d messages", len(msgs))
+	}
+}
+
+func TestFlushMessageFlushes(t *testing.T) {
+	c, cc := newCountingTestConnection(t)
+	if err := c.writeMessage(MsgCommandComplete, []byte("SELECT 1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.handleMessage(&Message{Type: MsgFlush}); err != nil {
+		t.Fatal(err)
+	}
+	if cc.writes == 0 {
+		t.Fatal("Flush message did not flush buffered data")
+	}
+}
+
+func TestMultiRowResultBuffersRows(t *testing.T) {
+	c, cc := newCountingTestConnection(t)
+	result := executor.NewResult("SELECT")
+	result.AddColumnWithType("n", "INTEGER")
+	const rows = 500
+	for i := 0; i < rows; i++ {
+		result.AddRow(int64(i))
+	}
+	if err := c.sendResult(result, &parser.SelectStmt{}); err != nil {
+		t.Fatal(err)
+	}
+	// sendResult emits RowDescription + rows DataRows + CommandComplete. With
+	// per-message flushing that would be rows+2 underlying writes; buffered it
+	// is bounded by the bufio.Writer capacity (a few flushes at most).
+	numMessages := rows + 2
+	if cc.writes >= numMessages {
+		t.Fatalf("sendResult flushed %d times, want fewer than %d messages", cc.writes, numMessages)
+	}
+	if cc.writes >= rows {
+		t.Fatalf("sendResult flushed %d times for %d rows, expected buffering", cc.writes, rows)
 	}
 }

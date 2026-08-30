@@ -23,19 +23,52 @@ type TableManager struct {
 
 	indexCache map[string]map[string][]int64 // index name → indexed value → rowids
 	indexTable map[string]string             // index name → table name
+	// disabledIndexes prevents a concurrent lookup from rebuilding an index
+	// after DROP has cleared it but before the schema entry is removed.
+	disabledIndexes map[string]bool
+
+	// counts holds exact per-table row counts for the COUNT(*) fast path.
+	// It is derived lazily from durable rows on first use and maintained
+	// incrementally by Insert/InsertBulk/Delete thereafter.
+	counts     map[string]int
+	countsInit map[string]bool
+
+	// locks is a map of per-table mutexes used to serialize cache/count/index
+	// loading (KV scan + install) against writes to the same table, so a scan
+	// cannot miss or double-count a concurrent write. Operations on different
+	// tables proceed concurrently. locksMu guards only the map itself and is
+	// never held across I/O or row operations.
+	locksMu sync.Mutex
+	locks   map[string]*sync.Mutex
 }
 
 // NewTableManager creates a new table manager.
 func NewTableManager(pool *KVPool, schema *SchemaManager, database string) *TableManager {
 	return &TableManager{
-		pool:       pool,
-		schema:     schema,
-		database:   database,
-		rowCache:   make(map[string][]Row),
-		rowIDMap:   make(map[string]map[int64]Row),
-		indexCache: make(map[string]map[string][]int64),
-		indexTable: make(map[string]string),
+		pool:            pool,
+		schema:          schema,
+		database:        database,
+		rowCache:        make(map[string][]Row),
+		rowIDMap:        make(map[string]map[int64]Row),
+		indexCache:      make(map[string]map[string][]int64),
+		indexTable:      make(map[string]string),
+		disabledIndexes: make(map[string]bool),
+		counts:          make(map[string]int),
+		countsInit:      make(map[string]bool),
+		locks:           make(map[string]*sync.Mutex),
 	}
+}
+
+// tableLock returns the per-table mutex keyed by lowercase table name.
+func (m *TableManager) tableLock(key string) *sync.Mutex {
+	m.locksMu.Lock()
+	l, ok := m.locks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		m.locks[key] = l
+	}
+	m.locksMu.Unlock()
+	return l
 }
 
 // invalidateCache removes a table's rows from the in-memory cache.
@@ -56,6 +89,186 @@ func (m *TableManager) invalidateCache(table string) {
 // InvalidateCache is the exported version for use by the executor.
 func (m *TableManager) InvalidateCache(table string) {
 	m.invalidateCache(table)
+}
+
+// loadTableLocked ensures the row cache for key is populated from durable rows.
+// The caller must hold the table's per-table lock so a concurrent write cannot
+// slip between the KV scan and the cache install.
+func (m *TableManager) loadTableLocked(key, table string) error {
+	m.cacheMu.RLock()
+	_, ok := m.rowCache[key]
+	m.cacheMu.RUnlock()
+	if ok {
+		return nil
+	}
+
+	prefix := m.dataPrefix(table)
+	var values []string
+	err := m.pool.WithClient(func(c *KVClient) error {
+		var err error
+		values, err = c.Reads(prefix)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	loaded := make([]Row, 0, len(values))
+	byRowID := make(map[int64]Row, len(values))
+	for _, data := range values {
+		var row Row
+		if err := json.Unmarshal([]byte(data), &row); err != nil {
+			continue
+		}
+		loaded = append(loaded, row)
+		if rowid, ok := valueAsInt64(row["_rowid_"]); ok {
+			byRowID[rowid] = row
+		}
+	}
+
+	m.cacheMu.Lock()
+	if _, ok := m.rowCache[key]; !ok {
+		m.rowCache[key] = loaded
+		m.rowIDMap[key] = byRowID
+	}
+	m.cacheMu.Unlock()
+
+	return nil
+}
+
+// loadTable populates the row cache for table, acquiring the per-table lock.
+func (m *TableManager) loadTable(key, table string) error {
+	tl := m.tableLock(key)
+	tl.Lock()
+	defer tl.Unlock()
+	return m.loadTableLocked(key, table)
+}
+
+// CountFast returns the exact number of rows in a table. The count is derived
+// from durable rows on first use (recovering across restarts) and then
+// maintained incrementally by the write paths, so repeated COUNT(*) queries
+// avoid a full table scan. It intentionally does not persist a counter to KV:
+// the KV layer has no atomic increment primitive, and a durable counter that
+// could diverge from the rows on crash would be worse than a lazily-derived,
+// always-exact value. The cost is one table scan the first time COUNT(*) is
+// issued after startup.
+func (m *TableManager) CountFast(table string) (int, error) {
+	key := strings.ToLower(table)
+
+	m.cacheMu.RLock()
+	init := m.countsInit[key]
+	n := m.counts[key]
+	m.cacheMu.RUnlock()
+	if init {
+		return n, nil
+	}
+
+	// Serialize first-time derivation against writes to this table so a
+	// concurrent insert/delete cannot be missed or double-counted.
+	tl := m.tableLock(key)
+	tl.Lock()
+	defer tl.Unlock()
+
+	m.cacheMu.RLock()
+	init = m.countsInit[key]
+	n = m.counts[key]
+	m.cacheMu.RUnlock()
+	if init {
+		return n, nil
+	}
+
+	prefix := m.dataPrefix(table)
+	var values []string
+	err := m.pool.WithClient(func(c *KVClient) error {
+		var err error
+		values, err = c.Reads(prefix)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	m.cacheMu.Lock()
+	m.counts[key] = len(values)
+	m.countsInit[key] = true
+	m.cacheMu.Unlock()
+
+	return len(values), nil
+}
+
+// incrCount adjusts the derived per-table row count. It is a no-op until the
+// count has been initialized, since an uninitialized count is re-derived from
+// durable rows (which already reflect the write) on next use.
+func (m *TableManager) incrCount(table string, delta int) {
+	key := strings.ToLower(table)
+	m.cacheMu.Lock()
+	if m.countsInit[key] {
+		m.counts[key] += delta
+	}
+	m.cacheMu.Unlock()
+}
+
+// cacheInsert adds a row to the in-memory row cache if it is already loaded.
+// It is idempotent: a rowid already present is not appended twice, so a
+// partially-observed bulk insert cannot duplicate cache entries.
+func (m *TableManager) cacheInsert(table string, row Row) {
+	key := strings.ToLower(table)
+	rowid, ok := rowIDFromRow(row)
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	byRowID, loaded := m.rowIDMap[key]
+	if !loaded {
+		return
+	}
+	if ok {
+		if _, exists := byRowID[rowid]; exists {
+			return
+		}
+		byRowID[rowid] = row
+	}
+	m.rowCache[key] = append(m.rowCache[key], row)
+}
+
+// cacheDelete removes a row from the in-memory row cache if it is already loaded.
+func (m *TableManager) cacheDelete(table string, row Row) {
+	key := strings.ToLower(table)
+	rowid, ok := rowIDFromRow(row)
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if ok {
+		if byRowID, exists := m.rowIDMap[key]; exists {
+			delete(byRowID, rowid)
+		}
+	}
+	if cached, exists := m.rowCache[key]; exists && ok {
+		for i, r := range cached {
+			if rid, rok := rowIDFromRow(r); rok && rid == rowid {
+				m.rowCache[key] = append(cached[:i], cached[i+1:]...)
+				break
+			}
+		}
+	}
+}
+
+// cacheUpdate replaces a row in the in-memory row cache if it is already loaded.
+func (m *TableManager) cacheUpdate(table string, row Row) {
+	key := strings.ToLower(table)
+	rowid, ok := rowIDFromRow(row)
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	if ok {
+		if byRowID, exists := m.rowIDMap[key]; exists {
+			byRowID[rowid] = row
+		}
+	}
+	if cached, exists := m.rowCache[key]; exists && ok {
+		for i, r := range cached {
+			if rid, rok := rowIDFromRow(r); rok && rid == rowid {
+				m.rowCache[key][i] = row
+				break
+			}
+		}
+	}
 }
 
 // dataKey returns the key for a row.
@@ -125,8 +338,13 @@ func (m *TableManager) Insert(table string, row Row) error {
 	}
 
 	pk := fmt.Sprintf("%v", pkValue)
+	tl := m.tableLock(strings.ToLower(table))
+	tl.Lock()
+	defer tl.Unlock()
 
-	// Check for duplicate
+	// Keep the duplicate check and write in one per-table critical section so
+	// concurrent inserts of the same primary key cannot both update the cache
+	// and row count for a single durable row.
 	key := m.dataKey(table, pk)
 	err = m.pool.WithClient(func(c *KVClient) error {
 		_, err := c.Read(key)
@@ -189,7 +407,6 @@ func (m *TableManager) Insert(table string, row Row) error {
 		return fmt.Errorf("failed to serialize row: %w", err)
 	}
 
-	// Write row
 	err = m.pool.WithClient(func(c *KVClient) error {
 		return c.Write(key, string(data))
 	})
@@ -200,7 +417,8 @@ func (m *TableManager) Insert(table string, row Row) error {
 	// Update in-memory indexes only. Durable index entries are derived from rows.
 	m.updateIndexesForRow(table, normalizedRow, true)
 
-	m.invalidateCache(table)
+	m.cacheInsert(table, normalizedRow)
+	m.incrCount(table, 1)
 	return nil
 }
 
@@ -283,6 +501,12 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 		rowKVs = append(rowKVs, kv{m.dataKey(table, pk), string(data)})
 	}
 
+	// Hold the per-table lock for the whole write+maintain phase so a
+	// concurrent cache/count load cannot scan a partially-written table.
+	tl := m.tableLock(strings.ToLower(table))
+	tl.Lock()
+	defer tl.Unlock()
+
 	// Write rows concurrently.
 	errs := make([]error, len(rowKVs))
 	var wg sync.WaitGroup
@@ -297,14 +521,25 @@ func (m *TableManager) InsertBulk(table string, rows []Row) (int, error) {
 		}()
 	}
 	wg.Wait()
-	for _, e := range errs {
-		if e != nil {
-			return 0, e
-		}
-	}
 
-	m.invalidateCache(table)
-	return len(normalized), nil
+	// Maintain in-memory caches only for rows that actually persisted, so a
+	// partial failure cannot leave an already-loaded cache/count stale.
+	var firstErr error
+	numOK := 0
+	for i, e := range errs {
+		if e != nil {
+			if firstErr == nil {
+				firstErr = e
+			}
+			continue
+		}
+		m.updateIndexesForRow(table, normalized[i], true)
+		m.cacheInsert(table, normalized[i])
+		numOK++
+	}
+	m.incrCount(table, numOK)
+
+	return numOK, firstErr
 }
 
 // updateIndexesForRow adds or removes entries from already-built in-memory
@@ -351,54 +586,28 @@ func (m *TableManager) Select(table string, filter func(Row) bool) ([]Row, error
 	}
 
 	key := strings.ToLower(table)
+	if err := m.loadTable(key, table); err != nil {
+		return nil, err
+	}
 
+	// Snapshot row references under the read lock, then filter and clone only
+	// matching rows without holding a lock. Published cached rows are immutable:
+	// writers replace row references rather than mutating their maps in place.
+	// This keeps selective scans from allocating a map for every examined row.
 	m.cacheMu.RLock()
-	cached, ok := m.rowCache[key]
+	cached := m.rowCache[key]
+	snapshot := append([]Row(nil), cached...)
 	m.cacheMu.RUnlock()
 
-	if !ok {
-		prefix := m.dataPrefix(table)
-		var values []string
-		err := m.pool.WithClient(func(c *KVClient) error {
-			var err error
-			values, err = c.Reads(prefix)
-			return err
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		loaded := make([]Row, 0, len(values))
-		byRowID := make(map[int64]Row, len(values))
-		for _, data := range values {
-			var row Row
-			if err := json.Unmarshal([]byte(data), &row); err != nil {
-				continue
-			}
-			loaded = append(loaded, row)
-			if rowid, ok := valueAsInt64(row["_rowid_"]); ok {
-				byRowID[rowid] = row
-			}
-		}
-
-		m.cacheMu.Lock()
-		m.rowCache[key] = loaded
-		m.rowIDMap[key] = byRowID
-		m.cacheMu.Unlock()
-
-		cached = loaded
-	}
-
 	if filter == nil {
-		result := make([]Row, len(cached))
-		for i, row := range cached {
-			result[i] = cloneRow(row)
+		rows := make([]Row, len(snapshot))
+		for i, row := range snapshot {
+			rows[i] = cloneRow(row)
 		}
-		return result, nil
+		return rows, nil
 	}
-
-	rows := make([]Row, 0, len(cached))
-	for _, row := range cached {
+	rows := make([]Row, 0, len(snapshot))
+	for _, row := range snapshot {
 		if filter(row) {
 			rows = append(rows, cloneRow(row))
 		}
@@ -453,9 +662,15 @@ func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) 
 		return 0, err
 	}
 
+	tl := m.tableLock(strings.ToLower(table))
+	tl.Lock()
+	defer tl.Unlock()
+
 	count := 0
 	for _, row := range rows {
-		// Remove old index entries before update
+		// Snapshot the pre-update row so removed index entries can be restored
+		// if persistence fails.
+		oldRow := cloneRow(row)
 		m.updateIndexesForRow(table, row, false)
 
 		// Apply updates
@@ -476,6 +691,7 @@ func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) 
 		// Serialize row
 		data, err := json.Marshal(row)
 		if err != nil {
+			m.updateIndexesForRow(table, oldRow, true)
 			continue
 		}
 
@@ -487,11 +703,13 @@ func (m *TableManager) Update(table string, updates Row, filter func(Row) bool) 
 		if err == nil {
 			// Add new index entries after update
 			m.updateIndexesForRow(table, row, true)
+			m.cacheUpdate(table, row)
 			count++
+		} else {
+			m.updateIndexesForRow(table, oldRow, true)
 		}
 	}
 
-	m.invalidateCache(table)
 	return count, nil
 }
 
@@ -509,14 +727,19 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 		return 0, err
 	}
 
+	tl := m.tableLock(strings.ToLower(table))
+	tl.Lock()
+	defer tl.Unlock()
+
 	count := 0
 	for _, row := range rows {
-		// Remove old index entries before update
+		oldRow := cloneRow(row)
 		m.updateIndexesForRow(table, row, false)
 
 		// Compute updates using the provided function
 		updates, err := updateFn(row)
 		if err != nil {
+			m.updateIndexesForRow(table, oldRow, true)
 			return count, err
 		}
 
@@ -538,6 +761,7 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 		// Serialize row
 		data, err := json.Marshal(row)
 		if err != nil {
+			m.updateIndexesForRow(table, oldRow, true)
 			continue
 		}
 
@@ -549,11 +773,13 @@ func (m *TableManager) UpdateFunc(table string, updateFn func(Row) (Row, error),
 		if err == nil {
 			// Add new index entries after update
 			m.updateIndexesForRow(table, row, true)
+			m.cacheUpdate(table, row)
 			count++
+		} else {
+			m.updateIndexesForRow(table, oldRow, true)
 		}
 	}
 
-	m.invalidateCache(table)
 	return count, nil
 }
 
@@ -570,6 +796,10 @@ func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) 
 		return 0, err
 	}
 
+	tl := m.tableLock(strings.ToLower(table))
+	tl.Lock()
+	defer tl.Unlock()
+
 	count := 0
 	for _, row := range rows {
 		// Remove index entries before deleting row
@@ -583,11 +813,15 @@ func (m *TableManager) Delete(table string, filter func(Row) bool) (int, error) 
 			return c.Delete(key)
 		})
 		if err == nil {
+			m.cacheDelete(table, row)
 			count++
+		} else {
+			// Restore the index entries removed above.
+			m.updateIndexesForRow(table, row, true)
 		}
 	}
 
-	m.invalidateCache(table)
+	m.incrCount(table, -count)
 	return count, nil
 }
 
@@ -695,10 +929,37 @@ func rowIDFromRow(row Row) (int64, bool) {
 func (m *TableManager) ensureIndex(index *Index) error {
 	indexKey := strings.ToLower(index.Name)
 	m.cacheMu.RLock()
+	disabled := m.disabledIndexes[indexKey]
 	_, initialized := m.indexCache[indexKey]
 	m.cacheMu.RUnlock()
+	if disabled {
+		return nil
+	}
 	if initialized {
 		return nil
+	}
+
+	// Serialize index build against writes to the same table so the derived
+	// entries cannot miss a concurrently-inserted row.
+	table := index.Table
+	key := strings.ToLower(table)
+	tl := m.tableLock(key)
+	tl.Lock()
+	defer tl.Unlock()
+
+	m.cacheMu.RLock()
+	disabled = m.disabledIndexes[indexKey]
+	_, initialized = m.indexCache[indexKey]
+	m.cacheMu.RUnlock()
+	if disabled {
+		return nil
+	}
+	if initialized {
+		return nil
+	}
+
+	if err := m.loadTableLocked(key, table); err != nil {
+		return err
 	}
 
 	columns := make([]string, len(index.Columns))
@@ -706,11 +967,8 @@ func (m *TableManager) ensureIndex(index *Index) error {
 		columns[i] = col.Name
 	}
 
-	rows, err := m.Select(index.Table, nil)
-	if err != nil {
-		return err
-	}
-
+	m.cacheMu.RLock()
+	rows := m.rowCache[key]
 	values := make(map[string][]int64)
 	for _, row := range rows {
 		rowid, ok := rowIDFromRow(row)
@@ -721,11 +979,12 @@ func (m *TableManager) ensureIndex(index *Index) error {
 		valueKey := formatIndexValue(colValue)
 		values[valueKey] = append(values[valueKey], rowid)
 	}
+	m.cacheMu.RUnlock()
 
 	m.cacheMu.Lock()
 	if _, initialized := m.indexCache[indexKey]; !initialized {
 		m.indexCache[indexKey] = values
-		m.indexTable[indexKey] = strings.ToLower(index.Table)
+		m.indexTable[indexKey] = key
 	}
 	m.cacheMu.Unlock()
 
@@ -805,6 +1064,13 @@ func (m *TableManager) LookupIndex(indexName string, colValue interface{}) ([]in
 
 // ClearIndex removes all entries for an index by scanning table and removing entries.
 func (m *TableManager) ClearIndex(indexName, tableName string, columns []string) error {
+	indexKey := strings.ToLower(indexName)
+	m.cacheMu.Lock()
+	delete(m.indexCache, indexKey)
+	delete(m.indexTable, indexKey)
+	m.disabledIndexes[indexKey] = true
+	m.cacheMu.Unlock()
+
 	rows, err := m.Select(tableName, nil)
 	if err != nil {
 		return err
@@ -823,6 +1089,13 @@ func (m *TableManager) ClearIndex(indexName, tableName string, columns []string)
 
 // BuildIndex builds index entries for all existing rows in a table.
 func (m *TableManager) BuildIndex(indexName, tableName string, columns []string) error {
+	indexKey := strings.ToLower(indexName)
+	m.cacheMu.Lock()
+	delete(m.disabledIndexes, indexKey)
+	delete(m.indexCache, indexKey)
+	delete(m.indexTable, indexKey)
+	m.cacheMu.Unlock()
+
 	index, err := m.schema.GetIndex(indexName)
 	if err == nil {
 		return m.ensureIndex(index)
@@ -844,7 +1117,6 @@ func (m *TableManager) BuildIndex(indexName, tableName string, columns []string)
 		values[formatIndexValue(colValue)] = append(values[formatIndexValue(colValue)], rowid)
 	}
 
-	indexKey := strings.ToLower(indexName)
 	m.cacheMu.Lock()
 	m.indexCache[indexKey] = values
 	m.indexTable[indexKey] = strings.ToLower(tableName)
@@ -896,20 +1168,15 @@ func (m *TableManager) SelectByIndex(table, indexName string, colValue interface
 		return []Row{}, nil
 	}
 
-	// Build a set of target rowids for O(1) lookup.
+	// Ensure the rowID map is loaded, then look up and clone rows under the
+	// read lock so writers cannot mutate the map concurrently.
 	key := strings.ToLower(table)
-	m.cacheMu.RLock()
-	byRowID, ok := m.rowIDMap[key]
-	m.cacheMu.RUnlock()
-	if !ok {
-		if _, err := m.Select(table, nil); err != nil {
-			return nil, err
-		}
-		m.cacheMu.RLock()
-		byRowID = m.rowIDMap[key]
-		m.cacheMu.RUnlock()
+	if err := m.loadTable(key, table); err != nil {
+		return nil, err
 	}
 
+	m.cacheMu.RLock()
+	byRowID := m.rowIDMap[key]
 	rows := make([]Row, 0, len(rowids))
 	seen := make(map[int64]struct{}, len(rowids))
 	for _, rid := range rowids {
@@ -918,9 +1185,10 @@ func (m *TableManager) SelectByIndex(table, indexName string, colValue interface
 		}
 		seen[rid] = struct{}{}
 		if row, ok := byRowID[rid]; ok {
-			rows = append(rows, row)
+			rows = append(rows, cloneRow(row))
 		}
 	}
+	m.cacheMu.RUnlock()
 
 	return rows, nil
 }

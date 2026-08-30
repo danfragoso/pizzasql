@@ -244,8 +244,12 @@ func (m *SchemaManager) DropTable(name string) error {
 func (m *SchemaManager) GetSchema(name string) (*Schema, error) {
 	m.mu.RLock()
 	if schema, ok := m.cache[strings.ToLower(name)]; ok {
+		// Clone while still holding the read lock: the cached schema's
+		// NextRowID field is mutated under the write lock, so cloning outside
+		// the lock races with that mutation.
+		cloned := cloneSchema(schema)
 		m.mu.RUnlock()
-		return cloneSchema(schema), nil
+		return cloned, nil
 	}
 	m.mu.RUnlock()
 
